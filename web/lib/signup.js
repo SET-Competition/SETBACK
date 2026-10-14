@@ -79,6 +79,24 @@ function buildRows(values) {
   /** @type {SignupRow[]} */
   const rows = [];
 
+  // Trimmed HERE rather than only at the call site, so this function is
+  // self-contained and the checks below are what the tests exercise.
+  //
+  // `required` on the inputs does NOT cover this: the browser accepts "   "
+  // as present, and a display_name that trims to empty then fails
+  // pending_signups_size_check in Postgres instead - a 400 the participant
+  // cannot act on, for a mistake the page can name precisely.
+  const displayName = (values.display_name || "").trim();
+  const email = (values.email || "").trim();
+
+  if (!displayName) {
+    return { rows: [], problem: "Enter a display name." };
+  }
+
+  if (!email) {
+    return { rows: [], problem: "Enter an email address." };
+  }
+
   for (const venue of VENUES) {
     const key = (values[venue.key] || "").trim();
     const secret = venue.secret ? (values[venue.secret] || "").trim() : "";
@@ -107,8 +125,8 @@ function buildRows(values) {
     }
 
     rows.push({
-      display_name: values.display_name,
-      email: values.email,
+      display_name: displayName,
+      email: email,
       exchange: venue.exchange,
       account_type: venue.account_type,
       api_key: key,

@@ -113,28 +113,70 @@ def test_every_field_the_importer_reads_is_one_the_form_sends():
 
 
 def test_the_form_reads_its_endpoint_from_the_environment():
-    """
-    No Supabase project is hardcoded in the committed page.
-
-    Neither value is secret - the anon key is public by design and RLS is what
-    constrains it - but a real project URL committed here is a live endpoint in
-    a public repository, and a fork submitting real credentials to it is
-    nobody's intention. The standalone form carried REPLACE_WITH_ placeholders
-    for this reason; a Next.js page reads NEXT_PUBLIC_* instead, so the check
-    is that it does exactly that and nothing is baked in.
-    """
+    """The page gets its endpoint from NEXT_PUBLIC_*, not from a literal."""
     text = REGISTER_PAGE.read_text(encoding="utf-8")
 
     for name in ("NEXT_PUBLIC_SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_ANON_KEY"):
         assert f"process.env.{name}" in text, \
             f"{REGISTER_PAGE.name} does not read {name} from the environment"
 
-    # A project URL, or a key, written into the source instead. The anon key is
-    # a JWT, so its `eyJ` prefix is the thing to look for.
-    assert ".supabase.co" not in text, \
-        f"a Supabase project URL is hardcoded in {REGISTER_PAGE.name}"
-    assert "eyJ" not in text, \
-        f"what looks like a Supabase key is hardcoded in {REGISTER_PAGE.name}"
+
+def test_no_supabase_project_is_hardcoded_anywhere_in_the_frontend():
+    """
+    Nothing COMMITTED under web/ carries a live project URL or key.
+
+    Neither value is secret - the anon key is public by design and RLS is what
+    constrains it - but a real project URL committed here is a live endpoint in
+    a public repository, and a fork submitting real credentials to it is
+    nobody's intention. The standalone form carried REPLACE_WITH_ placeholders
+    for this reason.
+
+    Scanned across the whole frontend rather than the one page that reads the
+    variables, because that is not the only place a value can land:
+    web/.env.example is COMMITTED (web/.gitignore un-ignores it), and
+    lib/leaderboard.ts reads the same two variables. Filling real values into
+    .env.example instead of .env.local is the easy mistake, and it publishes
+    the endpoint.
+
+    Driven off `git ls-files` deliberately: the risk is what gets COMMITTED. A
+    developer's own .env.local legitimately holds the real values and is
+    ignored, so scanning the working tree would fail for a correctly
+    configured checkout.
+    """
+    tracked = subprocess.run(
+        ["git", "ls-files", "web"],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=60)
+    assert tracked.returncode == 0, tracked.stderr
+    paths = [REPO_ROOT / line for line in tracked.stdout.split()]
+    assert paths, "git ls-files found nothing under web/ - is the frontend committed?"
+
+    # Matched on SHAPE, not on the bare domain, so the placeholder in
+    # .env.example stays legal while a real value does not. A Supabase project
+    # ref is 20 lowercase alphanumerics; "your-project" is neither 20 long nor
+    # free of hyphens. The anon key is a JWT, so it starts `eyJ` and keeps
+    # going in base64url - a prefix alone would fire on any word.
+    project_url = re.compile(r"https://[a-z0-9]{20}\.supabase\.co")
+    jwt = re.compile(r"eyJ[A-Za-z0-9_-]{20,}")
+
+    # package-lock.json is excluded: its base64 integrity hashes are a false
+    # positive waiting to happen, and no endpoint is ever configured there.
+    scanned = 0
+    for path in paths:
+        if path.name == "package-lock.json" or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue            # binary, e.g. favicon.ico
+        scanned += 1
+
+        rel = path.relative_to(REPO_ROOT)
+        assert not project_url.search(text), \
+            f"a real Supabase project URL is committed in {rel}"
+        assert not jwt.search(text), \
+            f"what looks like a Supabase key is committed in {rel}"
+
+    assert scanned > 5, f"only scanned {scanned} files under web/ - the glob looks wrong"
 
 
 def _credential_columns() -> list[str]:
