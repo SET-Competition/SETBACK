@@ -124,12 +124,12 @@ data.
 
 ## Participant signup
 
-Participants submit through a static form that POSTs to `pending_signups`.
-The importer verifies each key against the exchange, encrypts it under
-`FERNET_KEY`, and wipes the plaintext.
+Participants submit at **`/register`** in the frontend ([`web/`](web/)), which
+POSTs to `pending_signups`. The importer verifies each key against the
+exchange, encrypts it under `FERNET_KEY`, and wipes the plaintext.
 
 ```
-form  →  pending_signups        anon may INSERT, and nothing else
+/register  →  pending_signups   anon may INSERT, and nothing else
       →  sign_ups.py            verify read-only against the exchange
                                 → Fernet-encrypt → participant_api_keys
                                 → wipe the plaintext row
@@ -154,14 +154,19 @@ is resolved automatically at verification, so participants never supply it.
 
 **Setting it up**
 
-1. Fill in the two values in `CONFIG` at the bottom of
-   [`signup_form.html`](signup_form.html): your Supabase URL and your **anon**
-   key. Neither is secret — the anon key is public by design, and RLS is what
-   constrains it.
-2. Host the file anywhere static, over **HTTPS**. It can be embedded in a
-   Figma site, served from a Supabase Storage bucket, GitHub Pages, or
-   Netlify. Serve it over HTTPS because it asks people to type API keys.
+1. Set `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` on the
+   frontend — `web/.env.local` locally, the Vercel project's Variables tab in
+   production. Neither is secret: the anon key is public by design, and RLS is
+   what constrains it. Without them `/register` renders but refuses to submit
+   and says so.
+2. Deploy over **HTTPS**. The page disables itself outside a secure context,
+   because it asks people to type exchange credentials.
 3. Run `uv run python sign_ups.py` to drain the inbox.
+
+The validation that runs before a credential leaves the browser lives in
+[`web/lib/signup.js`](web/lib/signup.js), and `tests/test_signup_form.py`
+executes it under Node against this repository's schema — so the venue list,
+the POSTed columns and `pending_signups` cannot drift apart.
 
 **Drain it often.** Credentials sit in `pending_signups` **in plaintext**
 between submission and import — anyone who can read that table, and every
