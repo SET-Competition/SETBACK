@@ -1,9 +1,9 @@
 """
 The signup form agrees with the table it writes to and the code that reads it.
 
-Three artifacts have to use the same field names - an HTML page, a SQL table,
-and a Python importer - and nothing about that is checked by any of the three
-languages involved. The failure is quiet in the worst way: a misspelled field
+Three artifacts have to use the same field names - the frontend's signup
+module, a SQL table, and a Python importer - and nothing about that is checked
+by any of the three languages involved. The failure is quiet in the worst way: a misspelled field
 is simply absent from the POST body, so the row inserts fine with a NULL
 credential, and the participant is later told their API key was invalid.
 Nobody looks for a typo in a form when the exchange appears to be rejecting a
@@ -13,6 +13,12 @@ There is no browser cryptography here any more. The form POSTs plaintext to
 pending_signups and sign_ups.py encrypts it under FERNET_KEY on the way into
 participant_api_keys - which means the DRAINING is what bounds exposure, and
 what these tests can usefully protect is that the plumbing lines up.
+
+The logic used to live in a standalone signup_form.html at the repository
+root. It is now web/lib/signup.js, imported by the /register page. That file
+is .js rather than .ts on purpose: these tests extract the block between the
+PORTABLE LOGIC markers verbatim and run it under Node, so it cannot carry type
+annotations. Its types are JSDoc, which TypeScript honours in a .js file.
 """
 
 import json
@@ -24,7 +30,8 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-FORM = REPO_ROOT / "signup_form.html"
+FORM = REPO_ROOT / "web" / "lib" / "signup.js"
+REGISTER_PAGE = REPO_ROOT / "web" / "app" / "register" / "register-form.tsx"
 SCHEMA = REPO_ROOT / "migrations" / "schema.sql"
 
 PORTABLE = re.compile(
@@ -33,7 +40,7 @@ PORTABLE = re.compile(
 
 def _portable_source() -> str:
     match = PORTABLE.search(FORM.read_text(encoding="utf-8"))
-    assert match, ("the PORTABLE LOGIC markers are gone from signup_form.html "
+    assert match, (f"the PORTABLE LOGIC markers are gone from {FORM.name} "
                    "- these tests cannot find the code they check")
     return match.group(1)
 
@@ -41,7 +48,7 @@ def _portable_source() -> str:
 def _submit_fields() -> list[str]:
     """The field names the form POSTs, read out of the page itself."""
     block = re.search(r"const SUBMIT_FIELDS = \[(.*?)\];", _portable_source(), re.S)
-    assert block, "SUBMIT_FIELDS is missing from signup_form.html"
+    assert block, f"SUBMIT_FIELDS is missing from {FORM.name}"
     return re.findall(r'"([a-z_]+)"', block.group(1))
 
 
@@ -72,7 +79,7 @@ def test_every_submitted_field_is_a_real_column():
     """A field the form sends that the table does not have is a 400 at submit."""
     missing = set(_submit_fields()) - _pending_signups_columns()
     assert not missing, (
-        f"signup_form.html POSTs {sorted(missing)}, which pending_signups "
+        f"{FORM.name} POSTs {sorted(missing)}, which pending_signups "
         f"does not have. Supabase will reject the insert."
     )
 
@@ -105,19 +112,29 @@ def test_every_field_the_importer_reads_is_one_the_form_sends():
     )
 
 
-def test_the_form_is_committed_unconfigured():
+def test_the_form_reads_its_endpoint_from_the_environment():
     """
-    The committed copy carries placeholders, not a live endpoint.
+    No Supabase project is hardcoded in the committed page.
 
     Neither value is secret - the anon key is public by design and RLS is what
-    constrains it - but a real project URL committed here is a live endpoint
-    in a public repository, and a fork submitting real credentials to it is
-    nobody's intention.
+    constrains it - but a real project URL committed here is a live endpoint in
+    a public repository, and a fork submitting real credentials to it is
+    nobody's intention. The standalone form carried REPLACE_WITH_ placeholders
+    for this reason; a Next.js page reads NEXT_PUBLIC_* instead, so the check
+    is that it does exactly that and nothing is baked in.
     """
-    text = FORM.read_text(encoding="utf-8")
-    for name in ("SUPABASE_URL", "SUPABASE_ANON_KEY"):
-        assert f'{name}: "REPLACE_WITH_{name}"' in text, \
-            f"{name} in signup_form.html is not a placeholder"
+    text = REGISTER_PAGE.read_text(encoding="utf-8")
+
+    for name in ("NEXT_PUBLIC_SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_ANON_KEY"):
+        assert f"process.env.{name}" in text, \
+            f"{REGISTER_PAGE.name} does not read {name} from the environment"
+
+    # A project URL, or a key, written into the source instead. The anon key is
+    # a JWT, so its `eyJ` prefix is the thing to look for.
+    assert ".supabase.co" not in text, \
+        f"a Supabase project URL is hardcoded in {REGISTER_PAGE.name}"
+    assert "eyJ" not in text, \
+        f"what looks like a Supabase key is hardcoded in {REGISTER_PAGE.name}"
 
 
 def _credential_columns() -> list[str]:
