@@ -29,23 +29,38 @@ def test_the_reliability_threshold_matches_metrics():
     which stops being true the next time anything above it is edited - a
     pointer that rots silently is worse than none.
     """
-    metrics = re.search(
-        r'result\["reliable"\]\s*=\s*result\["periods"\]\s*>=\s*(\d+)',
-        METRICS.read_text(encoding="utf-8"))
-    assert metrics, (
+    source = METRICS.read_text(encoding="utf-8")
+
+    # Two spellings are accepted because metrics.py is mid-move from one to
+    # the other: a bare literal, or a module constant. Matching only the
+    # literal meant this test broke - not the code - the moment the constant
+    # was introduced, which is the opposite of what a drift test is for.
+    bound = re.search(
+        r'result\["reliable"\]\s*=\s*result\["periods"\]\s*>=\s*(\w+)',
+        source)
+    assert bound, (
         "could not find the `reliable` assignment in metrics.py - if the "
         "expression was rewritten, update this test to match its new shape "
         "rather than deleting it")
+
+    threshold = bound.group(1)
+    if not threshold.isdigit():
+        named = re.search(rf"^{re.escape(threshold)}\s*=\s*(\d+)",
+                          source, re.M)
+        assert named, (
+            f"metrics.py compares periods against `{threshold}`, which is not "
+            f"a number and is not assigned one at module level")
+        threshold = named.group(1)
 
     page = re.search(
         r"const RELIABLE_MIN_PERIODS = (\d+);",
         PAGE.read_text(encoding="utf-8"))
     assert page, "RELIABLE_MIN_PERIODS is missing from the leaderboard page"
 
-    assert page.group(1) == metrics.group(1), (
+    assert page.group(1) == threshold, (
         f"the board says {page.group(1)} return periods, metrics.py requires "
-        f"{metrics.group(1)} - every entry between the two is labelled "
-        f"provisional under a legend that denies it")
+        f"{threshold} - every entry between the two is labelled provisional "
+        f"under a legend that denies it")
 
 
 def test_the_page_does_not_cite_a_line_number_for_it():
