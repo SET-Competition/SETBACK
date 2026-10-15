@@ -3,7 +3,7 @@ Re-encrypt every stored credential under the current FERNET_KEY.
 
 Run this after rotating the key. The sequence is:
 
-  1. Generate a new key       python gen_fernet_key.py
+  1. Generate a new key       python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
   2. In the environment:      FERNET_KEY          = <new key>
                               FERNET_KEYS_RETIRED = <old key>
   3. python rotate_credentials.py
@@ -19,16 +19,31 @@ equivalent token, so a partial run just needs running again.
 
 import os
 
-from dotenv import load_dotenv
-from supabase import create_client
-
-from venue_common import get_fernet
 from cryptography.fernet import Fernet, InvalidToken
+from dotenv import load_dotenv
+
+import db
+from venue_common import get_fernet
 
 load_dotenv()
 
-supabase = create_client(os.getenv("SUPABASE_URL"),
-                         os.getenv("SUPABASE_KEY"))
+supabase = db.client()
+
+
+def _all_credentials(columns: str) -> list[dict]:
+    """
+    Every credential row, read to completion.
+
+    This module is where a silent truncation does permanent damage. PostgREST
+    caps a response at max-rows without saying so, and an unpaged read here
+    would rotate the first 1,000 credentials, verify the same 1,000, and then
+    report the retired key safe to delete - leaving every row past it
+    encrypted under a key nobody holds any more.
+    """
+    return db.fetch_all(
+        lambda: supabase.table("participant_api_keys").select(columns).order("id"),
+        "credentials")
+
 
 # The encrypted columns of participant_api_keys. api_passphrase is nullable,
 # so it's handled per-row rather than assumed present.
@@ -46,9 +61,7 @@ def rotate_all() -> None:
     """
     fernet = get_fernet()
 
-    rows = supabase.table("participant_api_keys").select(
-        "id,participant_id,api_key,api_secret,api_passphrase"
-    ).execute().data or []
+    rows = _all_credentials("id,participant_id,api_key,api_secret,api_passphrase")
 
     rotated = 0
     failed = 0
@@ -106,9 +119,7 @@ def report_credential_shapes() -> int:
     """
     fernet = get_fernet()
 
-    rows = supabase.table("participant_api_keys").select(
-        "id,participant_id,exchange,account_type,api_key,is_active"
-    ).execute().data or []
+    rows = _all_credentials("id,participant_id,exchange,account_type,api_key,is_active")
 
     unsafe = 0
     unreadable = 0
@@ -158,10 +169,9 @@ def verify_current_key_only() -> None:
     isn't.
     """
 
+    db.require_env("FERNET_KEY")
     current = Fernet(os.getenv("FERNET_KEY").strip().encode())
-    rows = supabase.table("participant_api_keys").select(
-        "id,api_key,api_secret,api_passphrase"
-    ).execute().data or []
+    rows = _all_credentials("id,api_key,api_secret,api_passphrase")
 
     stale = []
     for row in rows:

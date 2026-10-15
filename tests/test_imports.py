@@ -39,6 +39,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 REQUIRED_MODULES = (
     "coinbase",
     "coinbase_derivatives",
+    "db",
     "lighter",
     "metrics",
     "post_to_supabase",

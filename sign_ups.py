@@ -4,32 +4,24 @@ import os
 import sys
 from datetime import datetime, timezone
 
-from supabase import create_client
 from dotenv import load_dotenv
 
+import db
 import venues
 from venue_common import get_fernet
 
-# Reads participant signups from CSV, verifies their exchange credentials,
-# and stores them encrypted across `participants` and `participant_api_keys`.
+# Reads participant signups, verifies their exchange credentials, and stores
+# them encrypted across `participants` and `participant_api_keys`.
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Named here rather than left to fail inside the library. Getting the
-# environment wrong is the most common way this script goes wrong, and
-# create_client's own error doesn't say which variable was missing.
-_missing = [n for n in ("SUPABASE_URL", "SUPABASE_KEY") if not os.getenv(n)]
-if _missing:
-    raise RuntimeError(
-        "Missing required environment variable(s): " + ", ".join(_missing) +
-        ". Set them in your .env. FERNET_KEY is also required, and must be "
-        "the same key the sync uses, or nothing registered here will decrypt."
-    )
+db.require_env("SUPABASE_URL", "SUPABASE_KEY", "FERNET_KEY",
+               hint="FERNET_KEY must be the same key the sync uses, or nothing "
+                    "registered here will decrypt.")
 
-supabase = create_client(os.getenv("SUPABASE_URL"),
-                         os.getenv("SUPABASE_KEY"))
+supabase = db.client()
 
 SIGNUPS_CSV = "participant_signups.csv"
 
@@ -196,9 +188,13 @@ def import_signups(path: str = SIGNUPS_CSV) -> None:
 # The signup form's inbox
 #
 # The CSV path above requires an operator to collect plaintext credentials by
-# hand and keep them in a file on a laptop. This is the replacement: the
-# browser encrypts to SIGNUP_PUBLIC_KEY, the database stores only ciphertext,
-# and this drains it.
+# hand and keep them in a file on a laptop. This is the replacement: the form
+# POSTs to pending_signups, and this verifies, Fernet-encrypts and drains it.
+#
+# Rows there are PLAINTEXT until drained - the browser does not encrypt, since
+# Fernet is symmetric and the page would need FERNET_KEY to do it. So the
+# time between a submission and this running is the whole exposure: drain
+# often. See section 8 of migrations/schema.sql.
 # ---------------------------------------------------------------------------
 
 # How many times a submission is retried before it is given up on.

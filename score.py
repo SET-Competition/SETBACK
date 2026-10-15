@@ -24,7 +24,10 @@ import sys
 from datetime import datetime, timezone
 from math import isfinite
 
+import db
 import metrics
+
+supabase = db.client()
 
 logger = logging.getLogger(__name__)
 
@@ -176,19 +179,15 @@ def _drop_retired_periods() -> None:
     `--period daily` still clears retired rows instead of depending on which
     subset happened to be requested.
 
-    The select is unpaginated because the table holds exactly one row per
-    participant per period - a few hundred rows at this competition's size.
+    One DELETE ... WHERE period NOT IN (...), rather than reading the table to
+    work out what to remove: no read to page, nothing to get wrong as the
+    table grows, and one request per run instead of two.
     """
-    existing = (metrics.supabase.table("participant_scores")
-                .select("period").execute().data) or []
-
-    retired = sorted({row["period"] for row in existing} - set(PERIODS))
-    if not retired:
-        return
-
-    metrics.supabase.table("participant_scores").delete().in_("period", retired).execute()
-    logger.info("Removed score row(s) for retired period(s): %s",
-                ", ".join(retired))
+    deleted = (supabase.table("participant_scores")
+               .delete().not_.in_("period", list(PERIODS)).execute().data) or []
+    if deleted:
+        logger.info("Removed %d score row(s) for retired period(s): %s",
+                    len(deleted), ", ".join(sorted({r["period"] for r in deleted})))
 
 
 def write_all_scores(periods: tuple = PERIODS) -> dict:
@@ -201,8 +200,9 @@ def write_all_scores(periods: tuple = PERIODS) -> dict:
 
     Returns a summary for the caller to log.
     """
-    participants = (metrics.supabase.table("participants")
-                    .select("id").execute().data) or []
+    participants = db.fetch_all(
+        lambda: supabase.table("participants").select("id").order("id"),
+        "participants")
     ids = [p["id"] for p in participants]
 
     if not ids:
@@ -229,7 +229,7 @@ def write_all_scores(periods: tuple = PERIODS) -> dict:
     # this replaces the current row rather than accumulating history - the
     # score is recomputed from complete stored history every run, so a time
     # series is derivable from balance_snapshots whenever it is wanted.
-    metrics.supabase.table("participant_scores").upsert(
+    supabase.table("participant_scores").upsert(
         rows, on_conflict="participant_id,period"
     ).execute()
 
@@ -263,10 +263,13 @@ if __name__ == "__main__":
 
     write_all_scores(periods)
 
-    board = (metrics.supabase.table("leaderboard")
-             .select("rank,display_name,sharpe,reliable,periods,total_usdc,"
-                     "unreliable_reason")
-             .order("rank").execute().data) or []
+    # rank ties, so participant_id breaks them - paging needs a unique order.
+    board = db.fetch_all(
+        lambda: (supabase.table("leaderboard")
+                 .select("rank,display_name,sharpe,reliable,periods,total_usdc,"
+                         "unreliable_reason")
+                 .order("rank").order("participant_id")),
+        "leaderboard")
 
     print(f"\n{'rank':>4}  {'name':10} {'sharpe':>8}  {'rel':>4} {'per':>4}  "
           f"{'equity':>14}")

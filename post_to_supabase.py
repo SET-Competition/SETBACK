@@ -2,37 +2,22 @@ import logging
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from supabase import create_client
 from dotenv import load_dotenv
 
+import db
 import venues
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# Checked at import so a misconfigured service fails at startup, naming the
+# variable, rather than partway through a run.
+db.require_env("SUPABASE_URL", "SUPABASE_KEY", "FERNET_KEY",
+               hint="FERNET_KEY must be identical to the key that encrypted "
+                    "the stored credentials, or nothing will decrypt.")
 
-def _require_env(*names: str) -> None:
-    """
-    Fail with a readable message naming what's missing, rather than letting a
-    library raise several frames deep. On a scheduled runner the environment
-    is the most common thing to get wrong, and the default traceback doesn't
-    say which variable was absent.
-    """
-    missing = [n for n in names if not os.getenv(n)]
-    if missing:
-        raise RuntimeError(
-            "Missing required environment variable(s): " + ", ".join(missing) +
-            ". Set them in your .env locally, or in the service's Variables "
-            "on your host. FERNET_KEY must be identical to the key that "
-            "encrypted the stored credentials, or nothing will decrypt."
-        )
-
-
-_require_env("SUPABASE_URL", "SUPABASE_KEY", "FERNET_KEY")
-
-supabase = create_client(os.getenv("SUPABASE_URL"),
-                         os.getenv("SUPABASE_KEY"))
+supabase = db.client()
 
 # Credential decryption lives in coinbase.build_exchange - the Fernet cipher
 # is built there so only one place in the codebase touches the key.
@@ -40,28 +25,15 @@ supabase = create_client(os.getenv("SUPABASE_URL"),
 
 def get_active_participants() -> list[dict]:
     """
-    Fetches all participants from the Supabase database.
-    """
-    return supabase.table("participants").select("*").execute().data
+    Every participant, read to completion.
 
-
-def get_api_keys(participant_id) -> list[dict]:
+    Paged rather than a single select: PostgREST silently caps a response at
+    max-rows, and a participant missing from this list is never synced while
+    the run still reports success.
     """
-    Fetch one participant's active credential rows - one per venue, so a
-    participant trading both spot and perps comes back as two rows, each
-    carrying its own passphrase and portfolio UUID.
-
-    The sync itself uses get_all_api_keys(); this stays for ad hoc use on a
-    single participant.
-    """
-    response = (
-        supabase.table("participant_api_keys")
-        .select("*")
-        .eq("participant_id", participant_id)
-        .eq("is_active", True)
-        .execute()
-    )
-    return response.data or []
+    return db.fetch_all(
+        lambda: supabase.table("participants").select("*").order("id"),
+        "participants")
 
 
 def get_all_api_keys() -> dict[str, list[dict]]:
@@ -72,7 +44,7 @@ def get_all_api_keys() -> dict[str, list[dict]]:
     an N+1: at 200 participants the sync opened 200 round trips to Supabase
     before touching a single exchange, and each costs ~0.2s of pure latency
     whatever the row count. Grouping in memory is free by comparison, and the
-    whole table is a few hundred small rows.
+    whole table is a few hundred small rows, a page or two.
 
     Note this reads credentials for participants the loop may skip. That is
     fine - they are already encrypted, and get_active_participants() decides
@@ -84,18 +56,22 @@ def get_all_api_keys() -> dict[str, list[dict]]:
     # physical order, which shifts whenever a row is updated - so the winner
     # could change between runs. See get_last_flow_timestamp() for why that
     # used to matter and no longer does.
-    response = (
-        supabase.table("participant_api_keys")
-        .select("*")
-        .eq("is_active", True)
-        .order("exchange")
-        .order("account_type")
-        .order("id")
-        .execute()
-    )
+    #
+    # Paged, because PostgREST caps a response at max-rows WITHOUT saying so.
+    # At three venues a participant, a single select stops returning
+    # credentials at roughly 330 participants, and everyone past that point
+    # is simply never synced - with every run still green.
+    rows = db.fetch_all(
+        lambda: (supabase.table("participant_api_keys")
+                 .select("*")
+                 .eq("is_active", True)
+                 .order("exchange")
+                 .order("account_type")
+                 .order("id")),
+        "active credentials")
 
     by_participant: dict[str, list[dict]] = {}
-    for row in response.data or []:
+    for row in rows:
         by_participant.setdefault(row.get("participant_id"), []).append(row)
     return by_participant
 

@@ -10,11 +10,12 @@ import logging
 import math
 import os
 from datetime import datetime, timedelta, timezone
+from itertools import pairwise
 from statistics import mean, stdev
 
 from dotenv import load_dotenv
-from supabase import create_client
 
+import db
 # The competition window lives with the other competition-wide constants, not
 # here - every venue adapter reads the same two dates, and a second definition
 # would let the scoring window drift from the fetching one.
@@ -24,30 +25,8 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-
-def _require_env(*names: str) -> None:
-    """
-    Name what's missing, rather than surfacing a SupabaseException several
-    frames inside the library.
-
-    Deliberately duplicated from post_to_supabase rather than imported:
-    importing that module would run its own env check (including FERNET_KEY,
-    which metrics don't need) and build a second Supabase client as a side
-    effect. Ten lines is cheaper than that coupling.
-    """
-    missing = [n for n in names if not os.getenv(n)]
-    if missing:
-        raise RuntimeError(
-            "Missing required environment variable(s): " + ", ".join(missing) +
-            ". Set them in your .env, or in the service's Variables on your host."
-        )
-
-
-# Metrics only read, so no FERNET_KEY here - nothing is decrypted.
-_require_env("SUPABASE_URL", "SUPABASE_KEY")
-
-supabase = create_client(os.getenv("SUPABASE_URL"),
-                         os.getenv("SUPABASE_KEY"))
+# Metrics only read, so no FERNET_KEY is required - nothing is decrypted.
+supabase = db.client()
 
 
 def _window_ms() -> tuple[int, int | None]:
@@ -133,59 +112,12 @@ _PERIOD_STEPS = {
 _MAX_YEARS = 5
 
 
-# PostgREST caps how many rows one request may return (Supabase's `max-rows`
-# setting). It applies the cap SILENTLY - the response is a normal 200 with
-# fewer rows, not an error - so an unpaginated select looks like it worked
-# and simply omits the rest.
-#
-# That is worse here than it sounds. Snapshots are read oldest-first, so a
-# truncated read keeps the OLDEST rows: every participant's Sharpe would be
-# computed from a frozen window that stops advancing, and would keep looking
-# plausible while doing it. The sync writes one snapshot per credential per
-# run - around 500 rows a day at today's size - so this is a matter of weeks,
-# not a theoretical limit.
-_PAGE_SIZE = 1000
-
-# Refuse to walk more than this many rows for one participant. A participant
-# with a million snapshots is a bug, not a trader, and pulling it would take
-# the whole metrics run down with it.
-_MAX_FETCH_ROWS = 500_000
-
-
-def _fetch_all(build_query, label: str) -> list[dict]:
-    """
-    Run a select to completion, page by page.
-
-    Steps by the number of rows actually RETURNED rather than by the page
-    size asked for. That matters: if the server's cap is lower than
-    _PAGE_SIZE, a fixed stride would skip everything between the cap and the
-    stride - reading a fraction of the table while looking like a full scan.
-
-    `build_query` is a callable returning a fresh query, because a PostgREST
-    query object cannot be re-ranged once executed.
-    """
-    rows: list[dict] = []
-    start = 0
-
-    while True:
-        page = (build_query()
-                .range(start, start + _PAGE_SIZE - 1)
-                .execute().data) or []
-        if not page:
-            break
-
-        rows.extend(page)
-        start += len(page)
-
-        if start >= _MAX_FETCH_ROWS:
-            logger.warning(
-                "Stopped reading %s at %d rows - refusing to pull more for a "
-                "single participant. The metric below is computed on a "
-                "truncated history.", label, start
-            )
-            break
-
-    return rows
+# Every history read below goes through db.fetch_all, which pages past
+# PostgREST's silent max-rows cap. For snapshots the cap is worse than it
+# sounds: they are read oldest-first, so a truncated read keeps the OLDEST
+# rows and every Sharpe would be computed from a window that stops advancing
+# while still looking plausible. At one snapshot per credential per run that
+# is a matter of weeks, not a theoretical limit.
 
 
 def fetch_snapshots(participant_id: str) -> list[dict]:
@@ -197,7 +129,7 @@ def fetch_snapshots(participant_id: str) -> list[dict]:
     can shift between pages under an ambiguous sort - dropping one and
     repeating another.
     """
-    return _fetch_all(
+    return db.fetch_all(
         lambda: (supabase.table("balance_snapshots")
                  .select("exchange,account_type,timestamp,total_usdc")
                  .eq("participant_id", participant_id)
@@ -214,7 +146,7 @@ def fetch_cash_flows(participant_id: str) -> list[dict]:
     it is past the pairing window, so the sort is load-bearing rather than
     cosmetic.
     """
-    return _fetch_all(
+    return db.fetch_all(
         lambda: (supabase.table("cash_flows")
                  .select("exchange,account_type,timestamp,usdc_value,"
                          "direction,currency,amount")
@@ -250,7 +182,7 @@ def _fetch_grouped(table: str, columns: str, participant_ids: list[str],
 
     for i in range(0, len(participant_ids), chunk):
         batch = participant_ids[i:i + chunk]
-        rows = _fetch_all(
+        rows = db.fetch_all(
             lambda b=batch: (supabase.table(table)
                              .select(columns)
                              .in_("participant_id", b)
@@ -691,7 +623,7 @@ def period_returns(series: list[tuple[str, float | None]],
     flows = flows or {}
     returns = []
 
-    for (_, start), (end_key, end) in zip(series, series[1:]):
+    for (_, start), (end_key, end) in pairwise(series):
         if start is None or end is None:
             continue                        # gap in the record; see docstring
         if start <= 0:
@@ -746,25 +678,6 @@ def sharpe_from_returns(returns: list[float], risk_free_rate: float = 0.0,
         "volatility": volatility,
         "annualisation": f"sqrt({periods_per_year})",
     }
-
-
-def sharpe_ratio(values: list[float], risk_free_rate: float = 0.0,
-                 periods_per_year: int = 365) -> dict:
-    """
-    Sharpe ratio from raw portfolio values, with NO adjustment for deposits
-    or withdrawals.
-
-    Use participant_sharpe() for anything that ranks people - it subtracts
-    external flows first. This exists for testing the maths on a clean series.
-    """
-    if len(values) < 3:
-        raise ValueError(
-            f"Need at least 3 portfolio values to compute a Sharpe ratio, got "
-            f"{len(values)} - that's only {max(len(values) - 1, 0)} return(s)"
-        )
-
-    series = [(str(i), v) for i, v in enumerate(values)]
-    return sharpe_from_returns(period_returns(series), risk_free_rate, periods_per_year)
 
 
 def participant_sharpe(participant_id: str, period: str = "daily",
@@ -860,7 +773,10 @@ if __name__ == "__main__":
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
     )
-    for p in supabase.table("participants").select("id,display_name").execute().data:
+    participants = db.fetch_all(
+        lambda: supabase.table("participants").select("id,display_name").order("id"),
+        "participants")
+    for p in participants:
         try:
             r = participant_sharpe(p["id"])
             # sharpe is None whenever the volatility guard fires - formatting
