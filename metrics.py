@@ -84,6 +84,16 @@ def clip_to_competition(rows: list[dict]) -> list[dict]:
     return kept
 
 
+# How many single-period returns a Sharpe ratio needs before it is marked
+# reliable. Below this it is still computed and stored, but ranked as
+# provisional: over a handful of days the estimate is mostly noise.
+#
+# Named because it is not only this module's business. The leaderboard view
+# sorts on `reliable`, and the frontend's leaderboard page tells participants
+# the threshold in words, so the number is stated in two languages.
+# tests/test_metrics.py fails if web/ and this disagree.
+RELIABLE_MIN_PERIODS = 20
+
 # Crypto trades continuously, so a year is 365 days rather than 252 sessions.
 PERIODS_PER_YEAR = {
     "daily": 365,
@@ -763,7 +773,7 @@ def participant_sharpe(participant_id: str, period: str = "daily",
     # the result rather than leaving the caller to know it. Gaps count against
     # it too - `periods` is now the number of single-period returns that
     # survived, so an outage lowers this rather than silently compressing.
-    result["reliable"] = result["periods"] >= 20
+    result["reliable"] = result["periods"] >= RELIABLE_MIN_PERIODS
 
     return result
 
