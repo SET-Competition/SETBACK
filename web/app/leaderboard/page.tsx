@@ -11,8 +11,52 @@ export const metadata: Metadata = {
 // The sync runs hourly, so anything fresher than this is wasted work.
 export const revalidate = 300;
 
-const COMPETITION_START = "2026-09-01";
-const COMPETITION_END = "2026-10-26";
+/**
+ * The competition window, as shown in the header.
+ *
+ * Read from the environment because the BACKEND already does:
+ * `venue_common.py` takes COMPETITION_START/COMPETITION_END from env
+ * specifically so the window can change without a redeploy, and `metrics.py`
+ * scores against those values. With the dates hardcoded here, extending the
+ * run on Railway left the board advertising the old close date while the
+ * scorer used the new one - and the board is what participants believe.
+ *
+ * The fallbacks are the values this page carried before, so an unconfigured
+ * deployment renders exactly as it did rather than showing nothing.
+ */
+const COMPETITION_START = competitionDate(
+  process.env.NEXT_PUBLIC_COMPETITION_START,
+  "2026-09-01",
+);
+const COMPETITION_END = competitionDate(
+  process.env.NEXT_PUBLIC_COMPETITION_END,
+  "2026-10-26",
+);
+
+/**
+ * The backend wants the last INSTANT that counts, so its values are full
+ * timestamps - `COMPETITION_END=2026-10-26T23:59:59Z`. The header wants a
+ * date. Take the leading date and ignore the rest.
+ *
+ * Sliced rather than parsed through `Date`: `new Date("2026-09-01")` is UTC
+ * midnight, and formatting that in a negative-offset timezone renders the
+ * day before. A string that is already the date the organiser typed should
+ * not acquire a timezone on the way to the screen.
+ */
+function competitionDate(value: string | undefined, fallback: string): string {
+  const match = /^(\d{4}-\d{2}-\d{2})/.exec((value ?? "").trim());
+  return match ? match[1] : fallback;
+}
+
+/**
+ * `reliable` is `periods >= 20`, set in metrics.py - a Python constant, not
+ * an environment variable, so this is NOT read from env: that would add a
+ * second place to change it and a new way for the two to disagree. Named
+ * here so the coupling is visible, and so the number appears once.
+ *
+ * Keep in step with metrics.py:853.
+ */
+const RELIABLE_MIN_PERIODS = 20;
 
 function usd(value: number | null): string {
   if (value === null) return "—";
@@ -48,7 +92,10 @@ function Row({ row }: { row: LeaderboardRow }) {
         {provisional && (
           <span
             className="ml-2 rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-amber-400/90"
-            title={row.unreliable_reason ?? "fewer than 20 return periods"}
+            title={
+              row.unreliable_reason ??
+              `fewer than ${RELIABLE_MIN_PERIODS} return periods`
+            }
           >
             provisional
           </span>
@@ -109,7 +156,8 @@ export default async function Page() {
         <p className="mt-2 max-w-2xl text-sm leading-relaxed text-white/45">
           Ranked on a flow-adjusted Sharpe ratio: deposits and withdrawals are
           divided out, so this measures trading rather than deposit size.
-          Entries with fewer than 20 return periods are marked{" "}
+          Entries with fewer than {RELIABLE_MIN_PERIODS} return periods are
+          marked{" "}
           <span className="text-amber-400/80">provisional</span> and sort below
           established ones.
         </p>
