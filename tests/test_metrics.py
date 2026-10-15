@@ -439,3 +439,54 @@ def test_hourly_series_is_NOT_preserved_by_downsampling():
 
     assert (metrics.build_portfolio_series(full, period="hourly")
             != metrics.build_portfolio_series(_last_of_day(full), period="hourly"))
+
+
+# ---------------------------------------------------------------------------
+# The reliability threshold, as the frontend states it
+#
+# metrics.RELIABLE_MIN_PERIODS decides who is ranked as provisional. The
+# leaderboard page tells participants that number in words, in a different
+# language, deployed by a different service - so nothing but this test notices
+# when one changes and the other doesn't, and the page would then explain the
+# ranking with a rule the scorer no longer applies.
+# ---------------------------------------------------------------------------
+
+def _threshold_statements_in_web():
+    """Every number the frontend states as the provisional threshold."""
+    import re
+    from pathlib import Path
+
+    web = Path(__file__).resolve().parent.parent / "web"
+    if not web.is_dir():
+        pytest.skip("no web/ directory in this checkout")
+
+    patterns = (
+        re.compile(r"RELIABLE_MIN_PERIODS\s*=\s*(\d+)"),          # a named constant
+        re.compile(r"fewer than (\d+) return periods"),            # or the number in prose
+    )
+    found = []
+    for path in web.rglob("*"):
+        if (path.suffix not in (".ts", ".tsx", ".js", ".jsx")
+                or any(part in ("node_modules", ".next") for part in path.parts)):
+            continue
+        text = path.read_text(encoding="utf-8")
+        for pattern in patterns:
+            found += [(path.relative_to(web).as_posix(), int(n))
+                      for n in pattern.findall(text)]
+    return found
+
+
+def test_the_frontend_states_the_same_reliability_threshold():
+    statements = _threshold_statements_in_web()
+
+    # A guard that finds nothing guards nothing. If the page stops stating
+    # the threshold in one of these forms, say so rather than pass silently.
+    assert statements, (
+        "web/ no longer states the provisional threshold as "
+        "`RELIABLE_MIN_PERIODS = N` or 'fewer than N return periods' - update "
+        "this test's patterns to match how it does now")
+
+    wrong = [(f, n) for f, n in statements if n != metrics.RELIABLE_MIN_PERIODS]
+    assert not wrong, (
+        f"metrics.RELIABLE_MIN_PERIODS is {metrics.RELIABLE_MIN_PERIODS}, but "
+        f"the frontend says {wrong}")
