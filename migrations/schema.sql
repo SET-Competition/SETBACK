@@ -139,9 +139,12 @@ create table if not exists public.participants (
 -- trading both has two rows here sharing one participant_id. Values are
 -- Fernet-encrypted by sign_ups.py; plaintext keys never reach the database.
 --
--- portfolio_uuid is required for Coinbase perps (the INTX endpoints are
--- portfolio-scoped) and null for spot. Captured at signup by
--- find_perp_portfolio_uuid() so the sync never pays for that lookup.
+-- portfolio_uuid is set for Coinbase perps and null for spot. It is captured
+-- at signup from the key's REST permissions. Since 1 October 2026 perp data
+-- comes from the Deribit-powered derivatives gateway, whose access token is
+-- already bound to the key's portfolio, so the sync no longer needs this to
+-- scope requests - it is kept as the record of which portfolio the key was
+-- verified against, and checked against the one the gateway reports.
 -- ---------------------------------------------------------------------------
 
 create table if not exists public.participant_api_keys (

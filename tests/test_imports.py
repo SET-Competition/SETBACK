@@ -38,6 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # the module docstring.
 REQUIRED_MODULES = (
     "coinbase",
+    "coinbase_derivatives",
     "lighter",
     "metrics",
     "post_to_supabase",

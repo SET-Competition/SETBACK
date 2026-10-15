@@ -18,6 +18,11 @@ from venue_common import (COMPETITION_START,  # noqa: F401 - re-export, see abov
                           load_shared_markets, load_shared_tickers,
                           money_amount, resolve_since)
 
+# Perpetuals. Since 1 October 2026 they live on Coinbase's Deribit-powered
+# JSON-RPC gateway rather than INTX; everything account_type='perp' routes
+# there. Spot stays on Advanced Trade REST, in this module.
+import coinbase_derivatives
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -45,8 +50,9 @@ def exchange_from_env(account_type: str = 'spot') -> ccxt.Exchange:
     scripts only. The scheduled sync builds participants' exchanges with
     build_exchange() instead.
 
-    'perp' additionally reads COINBASEPERP_PORTFOLIO if set; without it the
-    perp functions discover the portfolio UUID on first use.
+    'perp' returns a client for the derivatives gateway rather than the
+    Advanced Trade REST API; see coinbase_derivatives. COINBASEPERP_PORTFOLIO,
+    if set, is checked against the portfolio the gateway reports for the key.
     """
     if account_type not in ENV_CREDENTIALS:
         raise ValueError(
@@ -63,14 +69,33 @@ def exchange_from_env(account_type: str = 'spot') -> ccxt.Exchange:
             f"{account_type} account"
         )
 
+    if account_type == 'perp':
+        return coinbase_derivatives.build_exchange(
+            api_key, api_secret, portfolio_uuid=os.getenv("COINBASEPERP_PORTFOLIO"))
+
     return build_exchange(
         api_key,
         api_secret,
         'coinbase',
         encrypted=False,  # .env keys are plaintext, unlike the Supabase ones
-        portfolio_uuid=(os.getenv("COINBASEPERP_PORTFOLIO")
-                        if account_type == 'perp' else None),
     )
+
+
+def _decrypt_credentials(api_key: str, api_secret: str, passphrase: str = None):
+    """Fernet-decrypt a stored credential. Shared by the spot and perp paths."""
+    fernet = get_fernet()
+    try:
+        api_key = fernet.decrypt(api_key.encode()).decode()
+        api_secret = fernet.decrypt(api_secret.encode()).decode()
+        if passphrase:
+            passphrase = fernet.decrypt(passphrase.encode()).decode()
+    except InvalidToken as e:
+        # Either the value was stored in plaintext or FERNET_KEY has rotated.
+        raise ValueError(
+            "Could not decrypt credentials - wrong FERNET_KEY, or the stored "
+            "values aren't encrypted (try encrypted=False)"
+        ) from e
+    return api_key, api_secret, passphrase
 
 
 def build_exchange(api_key: str, api_secret: str, exchange_id: str = 'coinbase',
@@ -93,27 +118,17 @@ def build_exchange(api_key: str, api_secret: str, exchange_id: str = 'coinbase',
     `passphrase` is only needed by venues whose requiredCredentials include
     'password' - coinbaseinternational does, plain coinbase does not.
 
-    `portfolio_uuid` scopes the instance to one Coinbase portfolio. The perp
-    (INTX) endpoints are portfolio-scoped and ccxt reads the UUID from
-    options['portfolio'], so setting it here means fetch_positions() works
-    without repeating params at every call site.
+    `portfolio_uuid` scopes the instance to one Coinbase portfolio, via
+    ccxt's options['portfolio']. This builds Advanced Trade (REST) clients
+    only: perpetuals moved to the derivatives gateway on 1 October 2026 and
+    are built by coinbase_derivatives.build_exchange instead.
     """
     if not api_key or not api_secret:
         raise ValueError("Both api_key and api_secret are required")
 
     if encrypted:
-        fernet = get_fernet()
-        try:
-            api_key = fernet.decrypt(api_key.encode()).decode()
-            api_secret = fernet.decrypt(api_secret.encode()).decode()
-            if passphrase:
-                passphrase = fernet.decrypt(passphrase.encode()).decode()
-        except InvalidToken as e:
-            # Either the value was stored in plaintext or FERNET_KEY has rotated.
-            raise ValueError(
-                "Could not decrypt credentials - wrong FERNET_KEY, or the stored "
-                "values aren't encrypted (try encrypted=False)"
-            ) from e
+        api_key, api_secret, passphrase = _decrypt_credentials(
+            api_key, api_secret, passphrase)
 
     if not hasattr(ccxt, exchange_id):
         raise ValueError(
@@ -280,12 +295,48 @@ def verify_credential(row: dict) -> dict:
                 "No perp portfolio visible to these credentials - the key may "
                 "be scoped to the spot portfolio instead"
             )
+        permissions = {**permissions,
+                       **verify_derivatives_access(row['api_key'], row.get('api_secret'),
+                                                   portfolio_uuid)}
     elif not permissions:
         # Only needed when permissions couldn't authenticate for us.
         exchange.fetch_balance()
 
     return {'account_type': account_type, 'portfolio_uuid': portfolio_uuid,
             'passphrase': passphrase, 'permissions': permissions}
+
+
+def verify_derivatives_access(api_key: str, api_secret: str,
+                              portfolio_uuid: str = None) -> dict:
+    """
+    Prove a perp key can actually read the derivatives gateway.
+
+    The REST permissions check above still works for a perp key - it is the
+    same CDP key, and still reports an INTX portfolio - but REST is not where
+    perp data comes from any more. A key that passes there and cannot exchange
+    a token on the gateway would register cleanly and then fail every hour.
+
+    Returns what the gateway granted, for storage alongside the REST
+    permissions. A scope other than view-only is logged rather than refused:
+    only 'rat#view' has been observed, and the REST can_trade/can_transfer
+    check is already the enforcement.
+    """
+    gateway = coinbase_derivatives.build_exchange(api_key, api_secret, portfolio_uuid)
+    try:
+        coinbase_derivatives.get_account_value(gateway)
+    except Exception as e:
+        raise ValueError(
+            f"This key passed Coinbase's permission check but could not read "
+            f"the derivatives gateway, which is where perpetuals have lived "
+            f"since 1 October 2026: {e}"
+        ) from e
+
+    if not coinbase_derivatives.scope_is_view_only(gateway.granted_scope):
+        logger.warning("Derivatives gateway granted scope %r to a perp key - "
+                       "expected view-only", gateway.granted_scope)
+
+    return {'gateway_scope': gateway.granted_scope,
+            'gateway_portfolio_uuid': gateway.gateway_portfolio_uuid}
 
 
 def build_from_credential(credential: dict) -> ccxt.Exchange:
@@ -297,7 +348,18 @@ def build_from_credential(credential: dict) -> ccxt.Exchange:
     Credential SHAPES differ - Coinbase needs a key/secret pair and an
     optional passphrase, Lighter needs a single token - and this is the one
     place per venue where that difference lives.
+
+    A 'perp' credential gets a derivatives-gateway client instead of an
+    Advanced Trade one. Same stored key, different API.
     """
+    if (credential.get("account_type") or "spot") == "perp":
+        api_key, api_secret, _ = _decrypt_credentials(
+            credential["api_key"], credential.get("api_secret"))
+        exchange = coinbase_derivatives.build_exchange(
+            api_key, api_secret, portfolio_uuid=credential.get("portfolio_uuid"))
+        load_shared_markets(exchange)
+        return exchange
+
     exchange = build_exchange(
         credential["api_key"],
         credential.get("api_secret"),
@@ -403,9 +465,10 @@ def find_perp_portfolio_uuid(exchange: ccxt.Exchange) -> str:
 
     # Match on TYPE, not name. A user can call any portfolio anything - one
     # test account here has an ordinary CONSUMER portfolio named "perps2",
-    # which a name-based match happily returns. The INTX endpoints would then
-    # be called with a non-INTX portfolio UUID and fail, or worse, quietly
-    # value the wrong account.
+    # which a name-based match happily returns. Coinbase still types the
+    # derivatives portfolio 'INTX' on the REST side after the move to the
+    # gateway, so the type test remains the right one; the stored UUID is
+    # what the gateway's portfolio is checked against.
     for portfolio in portfolios:
         if (portfolio.get('type') or '').upper() == 'INTX':
             return portfolio.get('id')
@@ -417,80 +480,6 @@ def find_perp_portfolio_uuid(exchange: ccxt.Exchange) -> str:
     return None
 
 
-def get_perp_account_value(exchange: ccxt.Exchange, portfolio_uuid: str = None) -> dict:
-    """
-    Value a Coinbase perpetuals (INTX) portfolio in a single API call.
-
-    Equity is read from summary.total_balance, which is the portfolio's net
-    liquidation value. Unrealized PnL is reported alongside it but NOT added -
-    see the warning below.
-
-    Position notional is reported separately and is deliberately not treated
-    as account value: a 5x levered position carries ~5x the notional of the
-    equity backing it, so totalling notionals would let perp traders dwarf
-    spot traders on a number measuring leverage rather than performance.
-
-    Note neither fetch_portfolio_details() nor fetch_balance() works here -
-    ccxt's parse_portfolio_details only reads `spot_positions`, and
-    type='future' routes to the CFM (US futures) endpoint, not INTX.
-    ----------------------------------------------------------------------
-    {'timestamp': ..., 'datetime': ..., 'account_type': 'perp',
-     'total_usdc': 12.0897, 'collateral_usdc': 12.0897,
-     'unrealized_pnl_usdc': 0.0, 'notional_usdc': 10.0997,
-     'buying_power_usdc': 10.06976}
-
-    For per-position detail (symbol, side, leverage, liquidation price) call
-    exchange.fetch_positions() separately - this endpoint only reports
-    portfolio-level aggregates.
-    """
-    timestamp = exchange.milliseconds()
-
-    if not portfolio_uuid:
-        portfolio_uuid = exchange.options.get('portfolio')
-    if not portfolio_uuid:
-        # Fall back to discovery so ad hoc calls work, but say so loudly: this
-        # is an extra API call on every sync if the UUID isn't stored.
-        logger.warning(
-            "No portfolio UUID given - discovering it. Store it in "
-            "participant_api_keys.portfolio_uuid to skip this lookup."
-        )
-        portfolio_uuid = find_perp_portfolio_uuid(exchange)
-    if not portfolio_uuid:
-        raise ValueError(
-            "No perp portfolio available for these credentials - pass "
-            "portfolio_uuid, or build the exchange with build_exchange(..., "
-            "portfolio_uuid=...)"
-        )
-
-    response = exchange.v3PrivateGetBrokerageIntxPortfolioPortfolioUuid(
-        {'portfolio_uuid': portfolio_uuid}
-    )
-
-    summary = response.get('summary') or {}
-    portfolios = response.get('portfolios') or []
-    # Per-portfolio detail (notional, collateral) lives in the list; the
-    # top-level summary carries the headline balances.
-    portfolio = portfolios[0] if portfolios else {}
-
-    if not summary and not portfolio:
-        logger.warning(
-            "INTX portfolio %s returned no summary or portfolios (keys: %s)",
-            portfolio_uuid, list(response.keys())
-        )
-
-    return {
-        'timestamp': timestamp,
-        'datetime': exchange.iso8601(timestamp),
-        'account_type': 'perp',
-        # Net liquidation value - the figure to rank participants on
-        'total_usdc': money_amount(summary.get('total_balance') or portfolio.get('total_balance')),
-        'collateral_usdc': money_amount(portfolio.get('collateral')),
-        'unrealized_pnl_usdc': money_amount(summary.get('unrealized_pnl') or portfolio.get('unrealized_pnl')),
-        'notional_usdc': money_amount(portfolio.get('position_notional')),
-        'buying_power_usdc': money_amount(summary.get('buying_power')),
-    }
-
-# print(get_perp_account_value(exchange))
 
 
 # Coinbase's account list is paged. ccxt's fetch_balance asks for one page of
@@ -557,9 +546,11 @@ def get_account_totals_usdc(exchange: ccxt.Exchange, account_type: str = 'spot',
     Value a participant's account in USDC.
 
     `account_type` selects the venue: 'spot' walks the wallet types and prices
-    each coin; 'perp' hands off to get_perp_account_value(). Both return a
-    'total_usdc' headline figure so callers (and the balance_snapshots table)
-    can treat them the same way.
+    each coin; 'perp' asks the derivatives gateway for the account's equity -
+    see coinbase_derivatives.get_account_value(). Both return a 'total_usdc'
+    headline figure so callers (and the balance_snapshots table) can treat
+    them the same way. `portfolio_uuid` is kept for interface parity; the
+    gateway's token is already bound to the key's portfolio.
 
     On exchanges where spot/margin/future share a single Unified Trading
     Account, ccxt can return identical balances for each wallet type -
@@ -571,7 +562,14 @@ def get_account_totals_usdc(exchange: ccxt.Exchange, account_type: str = 'spot',
      'account_type': 'spot', 'total_usdc': 129.18400834, 'spot_total_usdc': 129.18400834}
     """
     if account_type == 'perp':
-        return get_perp_account_value(exchange, portfolio_uuid)
+        if not coinbase_derivatives.is_gateway(exchange):
+            # An Advanced Trade client cannot reach perp data any more. Fail
+            # loudly rather than value the wrong thing.
+            raise ValueError(
+                "Perpetuals are valued on the derivatives gateway - build the "
+                "exchange with build_from_credential() or "
+                "exchange_from_env('perp')")
+        return coinbase_derivatives.get_account_value(exchange)
 
     # Only ask for wallet types the exchange actually has. Coinbase has no
     # options product, and 'future' resolves to the CFM (US futures) balance
@@ -752,9 +750,17 @@ def closed_orders(exchange: ccxt.Exchange, symbol: str = None, since=None, limit
     than fit in one page.
 
     `portfolio_uuid` scopes the fetch to one Coinbase portfolio. Without it
-    the Advanced Trade API answers for the key's default portfolio only, so a
-    participant's perp orders would be silently missing.
+    the Advanced Trade API answers for the key's default portfolio only.
+
+    A derivatives-gateway client is routed to coinbase_derivatives, whose
+    orders come back in the same ccxt unified shape and are cleaned here by
+    the same code - so a perp row and a spot row in trade_metrics mean the
+    same thing column for column.
     """
+    if coinbase_derivatives.is_gateway(exchange):
+        return _clean_orders(coinbase_derivatives.closed_orders(exchange, since=since),
+                             account_type='perp')
+
     request_params = {}
     if portfolio_uuid:
         request_params['retail_portfolio_id'] = portfolio_uuid
@@ -768,6 +774,16 @@ def closed_orders(exchange: ccxt.Exchange, symbol: str = None, since=None, limit
         since, limit, 'closed orders',
     )
 
+    return _clean_orders(raw_orders)
+
+
+def _clean_orders(raw_orders: list[dict], account_type: str = None) -> list[dict]:
+    """
+    ccxt unified orders -> trade_metrics rows.
+
+    `account_type` overrides account_type_from_order() when the caller knows
+    the venue for certain - gateway orders carry no product_type at all.
+    """
     clean_orders = []
 
     for order in raw_orders:
@@ -788,7 +804,9 @@ def closed_orders(exchange: ccxt.Exchange, symbol: str = None, since=None, limit
             if fee_currency is None and order.get('symbol'):
                 parts = order['symbol'].split('/')
                 if len(parts) == 2:
-                    fee_currency = parts[1]
+                    # 'PUMP/USDC:USDC' is a perp settled in USDC; the quote
+                    # half carries the settle suffix, which is not a currency.
+                    fee_currency = parts[1].split(':')[0]
 
             if amount is None:
                 logger.warning("Order %s has no amount/filled data, skipping", order.get('id'))
@@ -798,7 +816,7 @@ def closed_orders(exchange: ccxt.Exchange, symbol: str = None, since=None, limit
 
             clean_order = {
                 "participant_id": None,
-                'account_type': account_type_from_order(order),
+                'account_type': account_type or account_type_from_order(order),
                 'timestamp': order.get('timestamp'),
                 'datetime': order.get('datetime'),
                 'symbol': order.get('symbol'),
@@ -819,7 +837,6 @@ def closed_orders(exchange: ccxt.Exchange, symbol: str = None, since=None, limit
 
     return clean_orders
 
-# print(closed_orders(exchange, symbol=None, since = '2026-05-01T00:00:00Z'))
 
 def closed_trades(exchange: ccxt.Exchange, symbol: str = None, since=None,
                   limit: int = 200, portfolio_uuid: str = None) -> list[dict]:
@@ -1117,6 +1134,17 @@ def get_cash_flows(exchange: ccxt.Exchange, since=None, limit: int = 100,
 
     `since` accepts milliseconds or an ISO8601 string, matching closed_orders.
     """
+    if coinbase_derivatives.is_gateway(exchange):
+        # Coinbase's transfer history is account-wide and lives behind the
+        # spot (Advanced Trade) key - see CASH_FLOWS_ACCOUNT_TYPE. A perp key
+        # is only asked when the participant registered no spot key, and it
+        # has never been able to answer: the INTX key returned an empty list,
+        # and so does this. Returning it explicitly keeps that behaviour
+        # instead of crashing on REST-only calls the gateway client lacks.
+        logger.debug("Coinbase cash flows are collected via the spot key; "
+                     "a derivatives key has none to report")
+        return []
+
     since = resolve_since(exchange, since)
 
     try:
