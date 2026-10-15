@@ -537,3 +537,60 @@ def test_partially_reported_fees_sum_what_is_known(fills):
     b["fee_cost"] = None
     fills([a, b])
     assert lighter.closed_orders(None)[0]["fee_cost"] == pytest.approx(0.25)
+
+# ---------------------------------------------------------------------------
+# One account fetch per run, not two
+#
+# Lighter allows a standard account 60 requests a minute, per IP as well as
+# per account, so every Lighter credential in a run shares one 1 req/s
+# budget. Valuation and the cash-flow L1-address lookup used to fetch the
+# same account seconds apart; that second request cost a full second per
+# Lighter participant on every run.
+# ---------------------------------------------------------------------------
+
+class _CountingAccount:
+    """Just enough of a ccxt.lighter instance for valuation and cash flows."""
+
+    def __init__(self):
+        self.options = {}
+        self.balance_calls = 0
+
+    def fetch_balance(self, params=None):
+        self.balance_calls += 1
+        return {"info": {"accounts": [{
+            "l1_address": "0x" + "1" * 40, "collateral": "14.58",
+            "total_asset_value": "14.58", "available_balance": "14.58",
+            "cross_asset_value": "14.58"}]}}
+
+    def fetch_deposits(self, code=None, since=None, limit=None, params=None):
+        assert params and params.get("address"), "fetch_deposits needs the L1 address"
+        return []
+
+    def fetch_withdrawals(self, code=None, since=None, limit=None, params=None):
+        return []
+
+    def milliseconds(self):
+        return 1_790_000_000_000
+
+    def iso8601(self, ms):
+        return "2026-09-21T00:00:00.000Z"
+
+    def parse8601(self, text):
+        return 1_767_225_600_000
+
+
+def test_valuation_then_cash_flows_fetches_the_account_once():
+    exchange = _CountingAccount()
+
+    lighter.get_account_totals_usdc(exchange, "perp")
+    lighter.get_cash_flows(exchange)
+
+    assert exchange.balance_calls == 1
+
+
+def test_cash_flows_alone_still_find_the_address():
+    """Called on its own, nothing is cached - it must fetch rather than fail."""
+    exchange = _CountingAccount()
+
+    assert lighter._l1_address(exchange) == "0x" + "1" * 40
+    assert exchange.balance_calls == 1

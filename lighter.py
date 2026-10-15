@@ -680,6 +680,15 @@ def get_account_totals_usdc(exchange: ccxt.Exchange, account_type: str = ACCOUNT
 
     account = accounts[0]
 
+    # Leave the L1 address where _l1_address() will find it. get_cash_flows
+    # needs it, and without this it fetched this same account again seconds
+    # later. Lighter allows a standard account 60 requests a minute, per IP
+    # as well as per account, so the sync runs every Lighter credential
+    # through one shared 1 req/s budget - a redundant request costs a full
+    # second, for every Lighter participant, on every run.
+    if account.get('l1_address'):
+        exchange.options[_L1_ADDRESS_KEY] = account['l1_address']
+
     collateral = money_amount(account.get('collateral'))
     total = money_amount(account.get('total_asset_value'), default=collateral)
 
@@ -704,6 +713,9 @@ def get_account_totals_usdc(exchange: ccxt.Exchange, account_type: str = ACCOUNT
     }
 
 
+_L1_ADDRESS_KEY = '_setapi_l1_address'
+
+
 def _l1_address(exchange: ccxt.Exchange) -> str:
     """
     The Ethereum address that owns this Lighter account.
@@ -713,7 +725,14 @@ def _l1_address(exchange: ccxt.Exchange) -> str:
     read-only token path, where no private key exists - and it's the same
     value either way, since ccxt derives the address from the key precisely
     to look this account up.
+
+    Taken from what get_account_totals_usdc already fetched when it ran first,
+    as it does in the sync. Fetched here only when it hasn't.
     """
+    cached = exchange.options.get(_L1_ADDRESS_KEY)
+    if cached:
+        return cached
+
     accounts = ((exchange.fetch_balance().get('info') or {}).get('accounts')) or []
     if accounts:
         address = accounts[0].get('l1_address')
