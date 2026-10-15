@@ -14,15 +14,27 @@ export const revalidate = 300;
 /**
  * The competition window, as shown in the header.
  *
- * Read from the environment because the BACKEND already does:
- * `venue_common.py` takes COMPETITION_START/COMPETITION_END from env
- * specifically so the window can change without a redeploy, and `metrics.py`
- * scores against those values. With the dates hardcoded here, extending the
- * run on Railway left the board advertising the old close date while the
- * scorer used the new one - and the board is what participants believe.
+ * Read from the environment because the BACKEND already is: `venue_common.py`
+ * takes COMPETITION_START/COMPETITION_END from env, and `metrics.py` scores
+ * against those. With the dates hardcoded here, extending the run on Railway
+ * left the board advertising the old close date while the scorer used the new
+ * one - and the board is what participants believe.
  *
- * The fallbacks are the values this page carried before, so an unconfigured
- * deployment renders exactly as it did rather than showing nothing.
+ * TWO THINGS THIS DOES NOT DO, both of which have bitten already:
+ *
+ * 1. It does not make the board self-updating on Vercel. NEXT_PUBLIC_* values
+ *    are inlined at BUILD time and this route is prerendered, so editing the
+ *    variable changes nothing until a redeploy. The backend picks its values
+ *    up on restart; the frontend needs a new build. Changing the window means
+ *    changing it in both places AND redeploying this one.
+ *
+ * 2. It does not make the unset case agree with the backend. These fallbacks
+ *    are the dates this page shipped with, matching the root .env.example -
+ *    but venue_common.py defaults COMPETITION_START to 2026-01-01 and
+ *    COMPETITION_END to null (open-ended). So with nothing configured
+ *    anywhere, the board still advertises a window the scorer is not using.
+ *    The fallbacks exist so an unconfigured deployment renders something
+ *    rather than nothing; agreement comes from setting both sides.
  */
 const COMPETITION_START = competitionDate(
   process.env.NEXT_PUBLIC_COMPETITION_START,
@@ -44,8 +56,24 @@ const COMPETITION_END = competitionDate(
  * not acquire a timezone on the way to the screen.
  */
 function competitionDate(value: string | undefined, fallback: string): string {
-  const match = /^(\d{4}-\d{2}-\d{2})/.exec((value ?? "").trim());
-  return match ? match[1] : fallback;
+  const raw = (value ?? "").trim();
+  const match = /^(\d{4}-\d{2}-\d{2})/.exec(raw);
+  if (match) return match[1];
+
+  // A value that was SET but cannot be read is not the same as an unset one,
+  // and silently falling back makes them identical - which hides exactly the
+  // mistakes that matter: NEXT_PUBLIC_ omitted from the variable name, a
+  // locale format like 10/26/2026, a typo'd year. The board would keep
+  // showing the old date with nothing anywhere to say why.
+  //
+  // This runs at build time on Vercel, so the warning lands in the build log.
+  if (raw) {
+    console.warn(
+      `[leaderboard] ignoring unparseable competition date ${JSON.stringify(raw)} ` +
+      `- expected YYYY-MM-DD or a timestamp starting with it. Falling back to ${fallback}.`,
+    );
+  }
+  return fallback;
 }
 
 /**
@@ -54,7 +82,8 @@ function competitionDate(value: string | undefined, fallback: string): string {
  * second place to change it and a new way for the two to disagree. Named
  * here so the coupling is visible, and so the number appears once.
  *
- * Keep in step with metrics.py:853.
+ * Pinned to that expression by tests/test_leaderboard_page.py, which is the
+ * durable link - a line number here would rot on the next edit to metrics.py.
  */
 const RELIABLE_MIN_PERIODS = 20;
 

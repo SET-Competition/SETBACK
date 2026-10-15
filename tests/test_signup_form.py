@@ -153,10 +153,23 @@ def test_no_supabase_project_is_hardcoded_anywhere_in_the_frontend():
     # Matched on SHAPE, not on the bare domain, so the placeholder in
     # .env.example stays legal while a real value does not. A Supabase project
     # ref is 20 lowercase alphanumerics; "your-project" is neither 20 long nor
-    # free of hyphens. The anon key is a JWT, so it starts `eyJ` and keeps
-    # going in base64url - a prefix alone would fire on any word.
+    # free of hyphens.
     project_url = re.compile(r"https://[a-z0-9]{20}\.supabase\.co")
-    jwt = re.compile(r"eyJ[A-Za-z0-9_-]{20,}")
+
+    # BOTH key generations, because a project can be issued either and this
+    # repository has now seen both:
+    #
+    #   eyJ...              legacy anon / service_role, a JWT
+    #   sb_publishable_...  current anon-equivalent
+    #   sb_secret_...       current service_role-equivalent - the one that
+    #                       must never reach the frontend at all
+    #
+    # Matching only the JWT form, as this did, let a real sb_publishable_ key
+    # be committed to web/.env.example with the test still green - the exact
+    # mistake this test exists to catch, missed because the key format
+    # changed under it.
+    keys = re.compile(r"eyJ[A-Za-z0-9_-]{20,}"
+                      r"|sb_(?:publishable|secret)_[A-Za-z0-9_-]{20,}")
 
     # package-lock.json is excluded: its base64 integrity hashes are a false
     # positive waiting to happen, and no endpoint is ever configured there.
@@ -173,8 +186,10 @@ def test_no_supabase_project_is_hardcoded_anywhere_in_the_frontend():
         rel = path.relative_to(REPO_ROOT)
         assert not project_url.search(text), \
             f"a real Supabase project URL is committed in {rel}"
-        assert not jwt.search(text), \
-            f"what looks like a Supabase key is committed in {rel}"
+        found = keys.search(text)
+        assert not found, (
+            f"what looks like a Supabase key is committed in {rel} "
+            f"({found.group(0)[:18]}...)" if found else "")
 
     assert scanned > 5, f"only scanned {scanned} files under web/ - the glob looks wrong"
 

@@ -43,9 +43,16 @@ The two competition dates must match the backend's `COMPETITION_START` /
 `COMPETITION_END`, which `venue_common.py` reads from the environment and
 `metrics.py` scores against. Set them in one place and not the other and the
 board advertises a window the scorer is not using. Full timestamps are
-accepted — `2026-10-26T23:59:59Z` renders as `2026-10-26` — so the values can
-be copied verbatim from the backend. Unset falls back to the dates the page
-shipped with.
+accepted and its leading date is used — `2026-10-26T23:59:59Z` renders as
+`2026-10-26` — but set each to the date you want *displayed*, which is not
+always the backend value verbatim: an end of `2026-10-27T00:00:00Z` scores
+through the 26th and would display as the 27th.
+
+Unset falls back to the dates the page shipped with; an unparseable value is
+ignored and logged. Note that these are inlined at **build** time, so changing
+them on Vercel needs a redeploy — and that the backend's own defaults differ
+(`COMPETITION_START` defaults to 2026-01-01 and `COMPETITION_END` to
+open-ended), so leaving both sides unset does *not* make them agree.
 
 Never set `SUPABASE_KEY` (service_role) or `FERNET_KEY` here. They decrypt
 every participant's exchange credentials and belong only to the backend.
