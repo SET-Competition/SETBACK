@@ -1,7 +1,7 @@
 [project]
 name = "set-api"
 version = "0.1.0"
-description = "Add your description here"
+description = "Backend for a crypto trading competition: syncs read-only Coinbase and Lighter accounts into Supabase and ranks participants on flow-adjusted Sharpe."
 readme = "README.md"
 requires-python = ">=3.12"
 # Runtime only. This is what Railway installs to run post_to_supabase.py.

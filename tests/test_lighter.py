@@ -1,10 +1,7 @@
 """
 Tests for lighter.py.
 
-All offline - nothing here touches Lighter's API. The one place the live API
-was genuinely needed (confirming that an unfunded wallet raises rather than
-returning an empty list) is encoded as a fixture below, taken from the real
-response.
+All offline - nothing here touches Lighter's API.
 """
 
 import time
@@ -15,71 +12,20 @@ lighter = pytest.importorskip("lighter")
 ccxt = pytest.importorskip("ccxt")
 
 # A syntactically valid L1 key for a wallet that owns nothing. Never a real
-# key - tests must never depend on one.
+# key - tests must never depend on one. Only ever used to prove it is refused.
 FAKE_L1 = "0x" + "a" * 64
-
-
-@pytest.fixture
-def allow_wallet_keys(monkeypatch):
-    """
-    Opt in to the wallet-private-key path.
-
-    The competition refuses wallet keys outright - see the refusal tests
-    below. The path still exists for exchange_from_env(), where the operator
-    is testing against their OWN wallet on their own machine, so the tests
-    that cover it have to opt in exactly the way that operator does.
-
-    Requiring the flag here is deliberate: if the refusal were ever removed,
-    these tests would keep passing while the refusal tests failed, and it
-    would be obvious which behaviour changed.
-    """
-    monkeypatch.setenv("ALLOW_WALLET_KEYS", "1")
 
 
 # ---------------------------------------------------------------------------
 # build_exchange
 # ---------------------------------------------------------------------------
 
-def test_builds_from_a_plaintext_key(allow_wallet_keys):
-    ex = lighter.build_exchange(FAKE_L1, encrypted=False)
-    assert ex.id == "lighter"
-    assert ex.privateKey == FAKE_L1
-
-
-def test_account_index_reaches_ccxt_options(allow_wallet_keys):
-    """Stored at signup so the sync doesn't re-derive it every run."""
-    ex = lighter.build_exchange(FAKE_L1, encrypted=False, account_index=1077)
-    assert ex.options["accountIndex"] == 1077
-
-
-def test_api_key_blob_is_rejected_with_an_actionable_message(allow_wallet_keys):
-    """
-    Lighter issues 40-byte (80 hex char) API keys, and ccxt wants the 32-byte
-    L1 wallet key. Pasting the wrong one is the likeliest setup mistake, and
-    ccxt's own error points at a FAQ rather than saying which key it wants.
-
-    Only reachable by the operator now - a participant submitting this gets
-    the read-only-token refusal instead, which is the more useful answer for
-    them since no private key of any length would be accepted.
-    """
-    api_key_blob = "b" * 80
-    with pytest.raises(ValueError, match="L1 private key"):
-        lighter.build_exchange(api_key_blob, encrypted=False)
-
-
 def test_missing_key_is_rejected():
     with pytest.raises(ValueError, match="required"):
         lighter.build_exchange("", encrypted=False)
 
 
-def test_encrypted_key_round_trips(allow_wallet_keys):
-    from venue_common import get_fernet
-    token = get_fernet().encrypt(FAKE_L1.encode()).decode()
-    ex = lighter.build_exchange(token, encrypted=True)
-    assert ex.privateKey == FAKE_L1
-
-
-def test_undecryptable_key_names_the_likely_cause(allow_wallet_keys):
+def test_undecryptable_credential_names_the_likely_cause():
     with pytest.raises(ValueError, match="FERNET_KEY"):
         lighter.build_exchange("not-a-fernet-token", encrypted=True)
 
@@ -94,7 +40,7 @@ def test_undecryptable_key_names_the_likely_cause(allow_wallet_keys):
 # here that cannot be undone afterwards.
 # ---------------------------------------------------------------------------
 
-def test_a_wallet_private_key_is_refused_by_default():
+def test_a_wallet_private_key_is_refused():
     with pytest.raises(ValueError, match="WALLET PRIVATE KEY"):
         lighter.build_exchange(FAKE_L1, encrypted=False)
 
@@ -121,6 +67,26 @@ def test_tokens_are_unaffected_by_the_refusal():
     """The refusal must not cost the credential type we actually want."""
     ex = lighter.build_exchange(token(), encrypted=False)
     assert ex.id == "lighter"
+
+
+def test_a_wallet_address_is_refused_like_a_key():
+    address = "0x" + "3c03630c49b74c481d8458fa31e05828bf170bc3"
+    with pytest.raises(ValueError, match="WALLET PRIVATE KEY"):
+        lighter.build_exchange(address, encrypted=False)
+
+
+def test_the_old_operator_flag_no_longer_opens_anything(monkeypatch):
+    """
+    ALLOW_WALLET_KEYS used to let the operator authenticate with their own
+    wallet key. It is gone - a flag that must never be set on the deployed
+    service is a flag that eventually is. Setting it now must change nothing,
+    at build time or at signup.
+    """
+    monkeypatch.setenv("ALLOW_WALLET_KEYS", "1")
+    with pytest.raises(ValueError, match="WALLET PRIVATE KEY"):
+        lighter.build_exchange(FAKE_L1, encrypted=False)
+    with pytest.raises(ValueError, match="not a Lighter read-only token"):
+        lighter.verify_credential({"api_key": FAKE_L1, "account_type": "perp"})
 
 
 # ---------------------------------------------------------------------------
@@ -163,46 +129,6 @@ def test_spot_is_refused():
 def test_account_type_is_always_perp():
     assert lighter.account_type_from_order({"symbol": "ETH/USDC:USDC"}) == "perp"
     assert lighter.account_type_from_order({}) == "perp"
-
-
-# ---------------------------------------------------------------------------
-# find_account_index
-# ---------------------------------------------------------------------------
-
-class _Raises:
-    """Stands in for an exchange whose wallet has no Lighter account."""
-
-    def __init__(self, error):
-        self._error = error
-        self.privateKey = FAKE_L1
-        # Private-key path: no accountIndex cached, so find_account_index
-        # has to ask the API (and hit the error under test).
-        self.options = {}
-
-    def fetch_balance(self, params=None):
-        raise self._error
-
-    @staticmethod
-    def eth_get_address_from_private_key(_key):
-        return "0xdeadbeef"
-
-
-def test_unfunded_wallet_returns_none_not_an_error():
-    """
-    Taken from the live API: Lighter reports an unknown wallet as
-    code 21100 "account not found", NOT as an empty account list. Registering
-    a wallet that hasn't deposited yet must give a usable answer rather than
-    an opaque ExchangeError.
-    """
-    error = ccxt.ExchangeError('lighter {"code":21100,"message":"account not found"}')
-    assert lighter.find_account_index(_Raises(error)) is None
-
-
-def test_other_exchange_errors_still_propagate():
-    """Only 'account not found' is benign - everything else is a real fault."""
-    error = ccxt.ExchangeError('lighter {"code":500,"message":"internal error"}')
-    with pytest.raises(ccxt.ExchangeError):
-        lighter.find_account_index(_Raises(error))
 
 
 # ---------------------------------------------------------------------------
@@ -299,22 +225,6 @@ def test_orders_are_stamped_for_the_sync_to_fill_in(fills):
     order = lighter.closed_orders(None)[0]
     assert order["participant_id"] is None      # sync populates
     assert order["account_type"] == "perp"
-
-
-def test_wallet_address_is_rejected_as_a_key(allow_wallet_keys):
-    """
-    An address is 42 chars, short enough to pass the length check, so ccxt
-    would derive a different address from it and Lighter would answer
-    "account not found" - indistinguishable from a real but unfunded wallet.
-
-    Operator-path only now. A participant pasting an address gets the
-    read-only-token refusal, which is the better answer for them: telling
-    them "that's an address, not a private key" would imply a private key
-    was what we wanted.
-    """
-    address = "0x" + "3c03630c49b74c481d8458fa31e05828bf170bc3"
-    with pytest.raises(ValueError, match="ADDRESS, not a private key"):
-        lighter.build_exchange(address, encrypted=False)
 
 
 # ---------------------------------------------------------------------------
@@ -451,16 +361,6 @@ def test_signup_rejects_a_wallet_private_key():
         lighter.verify_credential({"api_key": FAKE_L1, "account_type": "perp"})
 
 
-def test_signup_rejects_a_wallet_key_even_with_the_operator_flag(monkeypatch):
-    """
-    ALLOW_WALLET_KEYS exists for the operator testing their own wallet from
-    their own machine. It must never let a PARTICIPANT register one.
-    """
-    monkeypatch.setenv("ALLOW_WALLET_KEYS", "1")
-    with pytest.raises(ValueError, match="not a Lighter read-only token"):
-        lighter.verify_credential({"api_key": FAKE_L1, "account_type": "perp"})
-
-
 def test_signup_rejects_a_wallet_address():
     address = "0x" + "3c03630c49b74c481d8458fa31e05828bf170bc3"
     with pytest.raises(ValueError, match="not a Lighter read-only token"):
@@ -513,12 +413,6 @@ def test_an_allowed_scope_passes_under_enforcement(monkeypatch):
     lighter._check_token_scope(lighter.parse_readonly_token(token(scope="read")))
 
 
-def test_find_account_index_uses_the_token_without_an_api_call():
-    """The index is a field in the token, so signup needs no lookup."""
-    ex = lighter.build_exchange_from_token(token(account_index=999), encrypted=False)
-    assert lighter.find_account_index(ex) == 999
-
-
 def test_absent_fee_stays_none_rather_than_becoming_zero(fills):
     """
     Lighter's trade payload has no fee field. Storing 0.0 would assert the
@@ -537,6 +431,7 @@ def test_partially_reported_fees_sum_what_is_known(fills):
     b["fee_cost"] = None
     fills([a, b])
     assert lighter.closed_orders(None)[0]["fee_cost"] == pytest.approx(0.25)
+
 
 # ---------------------------------------------------------------------------
 # One account fetch per run, not two

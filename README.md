@@ -11,11 +11,17 @@ deposit size.
 ## How it works
 
 ```
+/register (web/) ──► pending_signups ──► sign_ups.py: verify read-only,
+                                                      Fernet-encrypt
+        ┌────────────────────────────────────────────────┘
+        ▼
 participant_api_keys  (Fernet-encrypted credentials in Supabase)
         │
-        │  post_to_supabase.py, hourly
+        │  post_to_supabase.py, on Railway's cron
         ▼
-  decrypt ──► ccxt ──► balances, orders, transfers
+  decrypt ──► Coinbase spot     Advanced Trade REST        (ccxt.coinbase)
+          ──► Coinbase perps    derivatives JSON-RPC       (ccxt.deribit, adapted)
+          ──► Lighter perps     read-only token            (ccxt.lighter)
         │
         ▼
 balance_snapshots · trade_metrics · cash_flows · fetch_errors
@@ -45,7 +51,7 @@ Three properties the design turns on:
 ```bash
 uv sync --dev                 # install, including test dependencies
 cp .env.example .env          # then fill in SUPABASE_URL, SUPABASE_KEY, FERNET_KEY
-uv run pytest -q              # 308 tests, no network needed
+uv run pytest -q              # 356 tests, no network needed
 ```
 
 Apply the schema by pasting **`migrations/schema.sql`** into the Supabase SQL
@@ -63,12 +69,12 @@ The three that must be set:
 | Variable | Purpose |
 |---|---|
 | `SUPABASE_URL` | Project URL |
-| `SUPABASE_KEY` | `service_role` key — the sync writes, and RLS blocks `anon` |
-| `FERNET_KEY` | Decrypts stored participant credentials |
+| `SUPABASE_KEY` | The **secret** key (`sb_secret_…`), never the publishable one — the sync writes, and RLS blocks everything else |
+| `FERNET_KEY` | Decrypts stored participant credentials — must be identical locally and on Railway |
 
-Two that must **never** be set on the deployed service: `ALLOW_WALLET_KEYS`
-and `COINBASE_PERMISSIONS_OPTIONAL`. Both disable a read-only guarantee. See
-the warnings in `.env.example`.
+One that must **never** be set on the deployed service:
+`COINBASE_PERMISSIONS_OPTIONAL`, which turns a failure to read a Coinbase
+key's permissions into a pass. See the warning in `.env.example`.
 
 Locally these come from `.env` via `load_dotenv()`. On Railway there is no
 `.env` file — Railway injects the variables into the process before Python
@@ -202,6 +208,40 @@ its credential wiped.
 
 ---
 
+## Coinbase perpetuals
+
+On **1 October 2026** Coinbase moved international perpetuals off INTX and onto
+a Deribit-powered **JSON-RPC 2.0** gateway at `drb.coinbase.com/api/v2`, with
+no parallel run. Spot is unchanged and stays on Advanced Trade REST.
+
+ccxt has no support for the gateway, but the gateway *is* Deribit's API, so
+[`coinbase_derivatives.py`](coinbase_derivatives.py) subclasses
+`ccxt.deribit` and changes only two things: the host, and the auth — the
+participant's existing CDP key is exchanged at `public/auth`
+(`grant_type: coinbase_cdp`) for a 15-minute bearer token. Everything else is
+ccxt's own Deribit parsing, so perp orders reach `trade_metrics` in the same
+shape as spot ones. No new credentials, no new dependency.
+
+Three things about the gateway that fail silently if handled naively:
+
+- **Valuation** comes from `total_equity_usd`, an account-level figure.
+  Summing per-currency `margin_balance` counts the same collateral once per
+  listed currency — it turned a $19.95 account into $622.05.
+- **Order history needs both modes.** `historical=false` returns only the last
+  30 minutes of orders; `historical=true` excludes the most recent. The
+  adapter fetches both and merges them.
+- **Migration artifacts.** Each account's INTX balance arrived as a
+  `coinbase_migration` correction, and each open position was recreated by a
+  zero-fee block trade. Those recreations are dropped, so positions open on
+  1 October are not recorded twice.
+
+The old INTX REST endpoints still answer, as a mirror lagging the gateway by
+about a minute. They are not used: the documented path is the gateway, and an
+undocumented mirror of a product Coinbase says has ended can disappear without
+notice.
+
+---
+
 ## Deployment
 
 Railway, `railpack.json` → `python post_to_supabase.py`, on a cron schedule.
@@ -246,7 +286,8 @@ Credentials are rejected at registration unless they are provably read-only.
   rejection, not a pass.
 - **Lighter** — only `ro:` read-only tokens are accepted. An L1 wallet private
   key is unscoped and irrevocable, controlling every asset in the wallet on
-  every chain; it is refused at signup and again at build time.
+  every chain; it is refused at signup and again every time an exchange is
+  built, so one already stored stops working too. There is no override.
 
 `rotate_credentials.py --audit` reports the shape of every stored credential —
 `participant_id` and shape only, never a value, not even a prefix.

@@ -15,8 +15,7 @@ Four differences shape this whole module:
    'spot' raises rather than quietly returning an empty balance that would
    read as a participant with no money.
 
-2. TWO WAYS TO AUTHENTICATE, and the right one for a competition is the
-   less obvious one.
+2. READ-ONLY TOKENS ONLY, which is not what ccxt expects.
 
    ccxt's requiredCredentials is {'privateKey': True} - it expects the L1
    WALLET private key. That works, but a wallet private key is unscoped and
@@ -33,8 +32,9 @@ Four differences shape this whole module:
    options['auths'] therefore authenticates fully. Verified against the live
    API: fetch_balance and fetch_my_trades both succeed with privateKey=None.
 
-   Read-only tokens cannot move funds and expire on their own, so this
-   module prefers them and treats the private key as the fallback.
+   Read-only tokens cannot move funds and expire on their own, so they are
+   the only credential this module accepts. Anything else is refused - at
+   signup, and again every time an exchange is built.
 
 3. `since` IS NOT SENT TO THE SERVER. Both fetch_closed_orders and
    fetch_my_trades accept `since` but only use it to filter client-side after
@@ -103,15 +103,6 @@ ACCOUNT_TYPE = 'perp'
 # coinbase.CASH_FLOWS_ARE_ACCOUNT_WIDE.
 CASH_FLOWS_ARE_ACCOUNT_WIDE = False
 
-# ccxt raises NotSupported above this, and the message is unhelpful about
-# why. Checked here so a mis-pasted key fails at registration with something
-# a participant can act on.
-_MAX_PRIVATE_KEY_LENGTH = 66
-
-# 0x + 40 hex. Used only to tell an address apart from a key - see
-# build_exchange.
-_ADDRESS_LENGTH = 42
-
 # Lighter's read-only tokens are 'ro:<account_index>:<scope>:<deadline>:<sig>'
 # - the account index and expiry come free, so a token needs no extra lookup
 # to be usable.
@@ -170,9 +161,9 @@ def build_exchange_from_token(token: str, encrypted: bool = True,
     """
     Build a Lighter instance authenticated by a READ-ONLY TOKEN.
 
-    Preferred over the private-key path: a read-only token cannot move funds
-    and expires by itself, so collecting one per participant carries none of
-    the custody risk that collecting wallet keys does.
+    The only credential accepted: a read-only token cannot move funds and
+    expires by itself, so collecting one per participant carries none of the
+    custody risk that collecting wallet keys does.
 
     ccxt has no public API for this - it always expects to mint its own
     tokens from a signer - so the token is written straight into the internal
@@ -283,150 +274,61 @@ def _check_token_scope(details: dict) -> None:
     )
 
 
-def _refuse_wallet_key() -> None:
+_WALLET_KEY_REFUSAL = (
+    "Refusing to use a Lighter WALLET PRIVATE KEY. This competition only "
+    "reads balances, so it accepts read-only tokens only - a token starts "
+    "'ro:', cannot move funds, and expires on its own. A wallet private "
+    "key controls every asset in the wallet on every chain and cannot be "
+    "revoked. Generate a read-only token in the Lighter UI and register "
+    "that instead."
+)
+
+
+def build_exchange(credential: str, encrypted: bool = True,
+                   api_key_index=None, **options) -> ccxt.Exchange:
     """
-    Refuse to authenticate Lighter with an L1 wallet private key.
+    Build a ccxt Lighter instance for one participant, from a READ-ONLY TOKEN.
 
-    A read-only token is scoped and expiring; a wallet private key is neither.
-    It controls every asset in that wallet on every chain, it cannot be made
-    read-only, and it cannot be revoked - "rotating" it means moving all the
-    funds somewhere else. Accepting one makes this service the custodian of a
-    competitor's entire wallet, permanently, for a competition that only ever
-    needed to READ their balance.
+    `credential` is what participant_api_keys.api_key holds, Fernet-encrypted,
+    so `encrypted` defaults to True. Pass encrypted=False for a plaintext
+    token from .env.
 
-    That is the one mistake here that cannot be undone afterwards, which is
-    why the check is a hard refusal rather than a warning.
+    ANYTHING THAT IS NOT A READ-ONLY TOKEN IS REFUSED, unconditionally. A
+    wallet private key controls every asset in that wallet on every chain,
+    cannot be made read-only and cannot be revoked - accepting one makes this
+    service the custodian of a competitor's whole wallet, for a competition
+    that only ever reads a balance. It is the one mistake here that cannot be
+    undone afterwards.
 
-    It lives in build_exchange rather than only in verify_credential on
-    purpose: signup-time validation protects new registrations, but a wallet
-    key already sitting in participant_api_keys would otherwise keep working
-    forever. Refusing on the path every credential actually goes through
-    covers both.
+    The refusal lives here, on the path every credential takes, and not only
+    at signup: signup validation does nothing about a wallet key already
+    sitting in participant_api_keys, which would otherwise keep working
+    forever.
 
-    ALLOW_WALLET_KEYS exists for exchange_from_env(), where the operator is
-    testing against their OWN wallet from their own machine. It must never be
-    set on the deployed service.
+    There used to be an escape hatch, an ALLOW_WALLET_KEYS flag letting the
+    operator test with their own wallet key. It went once a read-only token
+    covered that case too. A flag that must never be set on the deployed
+    service is a flag that eventually is.
     """
-    if os.getenv("ALLOW_WALLET_KEYS", "").strip().lower() in ("1", "true", "yes"):
-        logger.warning(
-            "ALLOW_WALLET_KEYS is set - authenticating Lighter with a wallet "
-            "private key. This must never be set on the deployed service."
-        )
-        return
-
-    raise ValueError(
-        "Refusing to use a Lighter WALLET PRIVATE KEY. This competition only "
-        "reads balances, so it accepts read-only tokens only - a token starts "
-        "'ro:', cannot move funds, and expires on its own. A wallet private "
-        "key controls every asset in the wallet on every chain and cannot be "
-        "revoked. Generate a read-only token in the Lighter UI and register "
-        "that instead."
-    )
-
-
-def build_exchange(private_key: str, encrypted: bool = True,
-                   account_index=None, api_key_index=None,
-                   **options) -> ccxt.Exchange:
-    """
-    Build a ccxt Lighter instance for one participant.
-
-    Deliberately NOT compatible with coinbase.build_exchange's signature:
-    Lighter authenticates with an L1 private key and has no api key or
-    secret, so pretending the two take the same arguments would only hide
-    that. post_to_supabase dispatches on the credential's `exchange` column.
-
-    `private_key` is Fernet-encrypted in participant_api_keys, so `encrypted`
-    defaults to True. Pass encrypted=False for a plaintext key from .env.
-
-    `account_index` scopes the instance to one Lighter sub-account. ccxt can
-    derive it from the private key, but that costs an extra public call on
-    every use - find_account_index() resolves it once at signup so the sync
-    doesn't pay for it every run. Same pattern as Coinbase's portfolio_uuid.
-
-    A READ-ONLY TOKEN passed here is routed to build_exchange_from_token()
-    instead. Both credential types live in the same column, so the sync
-    doesn't need to know which a participant registered - and a token is the
-    better answer for everyone, since it can't move funds.
-
-    THE WALLET-KEY PATH IS REFUSED unless ALLOW_WALLET_KEYS is set. See
-    _refuse_wallet_key() for why, and why the check lives here rather than
-    only at signup.
-    """
-    if not private_key:
-        raise ValueError("A private_key is required")
-
-    # Detected before decryption too - a stored token arrives Fernet-encrypted
-    # and won't show its prefix until build_exchange_from_token decrypts it.
-    if not encrypted and private_key.strip().startswith(_TOKEN_PREFIX):
-        return build_exchange_from_token(
-            private_key, encrypted=False,
-            api_key_index=api_key_index or _DEFAULT_API_KEY_INDEX, **options)
+    if not credential:
+        raise ValueError("A credential is required")
 
     if encrypted:
         try:
-            probe = get_fernet().decrypt(private_key.encode()).decode()
-        except InvalidToken:
-            probe = ''
-        if probe.strip().startswith(_TOKEN_PREFIX):
-            return build_exchange_from_token(
-                probe, encrypted=False,
-                api_key_index=api_key_index or _DEFAULT_API_KEY_INDEX, **options)
-
-    # Everything below this line is the WALLET PRIVATE KEY path. Anything that
-    # reaches it is not a read-only token, so it is refused by default.
-    _refuse_wallet_key()
-
-    if encrypted:
-        try:
-            private_key = get_fernet().decrypt(private_key.encode()).decode()
+            credential = get_fernet().decrypt(credential.encode()).decode()
         except InvalidToken as e:
             raise ValueError(
-                "Could not decrypt the Lighter private key - wrong FERNET_KEY, "
+                "Could not decrypt the Lighter credential - wrong FERNET_KEY, "
                 "or the stored value isn't encrypted (try encrypted=False)"
             ) from e
 
-    private_key = private_key.strip()
+    credential = credential.strip()
+    if not credential.startswith(_TOKEN_PREFIX):
+        raise ValueError(_WALLET_KEY_REFUSAL)
 
-    # ccxt raises NotSupported for anything longer, pointing at its FAQ. Say
-    # the actionable thing instead: it wants the L1 key, not an API key blob.
-    if len(private_key) > _MAX_PRIVATE_KEY_LENGTH:
-        raise ValueError(
-            f"Lighter private key is {len(private_key)} characters; ccxt "
-            f"expects the L1 private key (at most "
-            f"{_MAX_PRIVATE_KEY_LENGTH}). A Lighter API-key blob is not the "
-            f"same thing and will not authenticate."
-        )
-
-    # An address is 0x + 40 hex; a private key is 0x + 64 hex. Pasting the
-    # address is an easy mistake and a nasty one to diagnose: it's short
-    # enough to pass the check above, ccxt then derives a DIFFERENT address
-    # from it, and Lighter answers "account not found" - the exact error a
-    # real-but-unfunded wallet gives. Caught here so the two stay
-    # distinguishable.
-    if len(private_key) == _ADDRESS_LENGTH and private_key.startswith('0x'):
-        raise ValueError(
-            "That looks like a wallet ADDRESS, not a private key. An address "
-            "is public and cannot sign; ccxt derives it from the private key "
-            "instead. Export the private key of the wallet that owns the "
-            "Lighter account (0x + 64 hex characters)."
-        )
-
-    config = {
-        'privateKey': private_key,
-        'enableRateLimit': True,
-        **options,
-    }
-
-    exchange = ccxt.lighter(config)
-    install_shared_rate_limit(exchange)
-
-    # ccxt reads both out of options when the caller doesn't pass them.
-    if account_index is not None:
-        exchange.options['accountIndex'] = account_index
-    if api_key_index is not None:
-        exchange.options['apiKeyIndex'] = api_key_index
-
-    return exchange
+    return build_exchange_from_token(
+        credential, encrypted=False,
+        api_key_index=api_key_index or _DEFAULT_API_KEY_INDEX, **options)
 
 
 def verify_credential(row: dict) -> dict:
@@ -475,9 +377,9 @@ def verify_credential(row: dict) -> dict:
         )
 
     # Parses the token and proves it is well-formed and unexpired. The account
-    # index travels INSIDE the token, so this replaces the find_account_index()
-    # call that used to be here - one fewer API request per registration, and
-    # one fewer way for signup to fail on a network blip.
+    # index travels INSIDE the token, so registration needs no lookup - one
+    # fewer API request, and one fewer way for signup to fail on a network
+    # blip.
     details = parse_readonly_token(credential)
     _check_token_scope(details)
 
@@ -522,19 +424,12 @@ def build_from_credential(credential: dict) -> ccxt.Exchange:
     The uniform entry point every venue adapter provides. Lighter's credential
     shape differs from Coinbase's in two ways this absorbs:
 
-      api_key         holds the WHOLE credential - a read-only token, or an
-                      L1 private key. api_secret is null; there is no pair.
-      portfolio_uuid  holds the account index, an integer rather than a UUID.
-                      Ignored on the token path, where the index travels
-                      inside the token itself.
+      api_key         holds the WHOLE credential - a read-only token.
+                      api_secret is null; there is no pair.
+      portfolio_uuid  holds the account index, recorded at signup. Not needed
+                      here: the index travels inside the token itself.
     """
-    account_index = credential.get("portfolio_uuid")
-
-    exchange = build_exchange(
-        credential["api_key"],
-        encrypted=True,
-        account_index=account_index,
-    )
+    exchange = build_exchange(credential["api_key"], encrypted=True)
 
     # Before any other call - ccxt loads markets itself at the top of
     # fetch_balance and fetch_my_trades, so priming later is too late to
@@ -547,86 +442,15 @@ def build_from_credential(credential: dict) -> ccxt.Exchange:
 
 def exchange_from_env() -> ccxt.Exchange:
     """
-    Build a Lighter exchange from your own .env credential, for local
+    Build a Lighter exchange from your own .env read-only token, for local
     testing. Mirrors coinbase.exchange_from_env.
-
-    Prefers LIGHTER_READONLY_TOKEN and falls back to LIGHTER_PRIVATEKEY, so
-    a machine holding both uses the one that can't move money.
     """
     token = os.getenv(ENV_CREDENTIALS[ACCOUNT_TYPE])
-    if token:
-        return build_exchange_from_token(token, encrypted=False)
-
-    private_key = os.getenv("LIGHTER_PRIVATEKEY")
-    if not private_key:
+    if not token:
         raise RuntimeError(
-            f"Set {ENV_CREDENTIALS[ACCOUNT_TYPE]} (preferred - read-only, "
-            f"cannot move funds) or LIGHTER_PRIVATEKEY in .env to use Lighter"
-        )
-
-    return build_exchange(
-        private_key,
-        encrypted=False,                 # .env keys are plaintext
-        account_index=os.getenv("LIGHTER_ACCOUNT_INDEX"),
-        api_key_index=os.getenv("LIGHTER_APIKEY_INDEX"),
-    )
-
-
-def find_account_index(exchange: ccxt.Exchange) -> str:
-    """
-    Discover the Lighter sub-account index for a set of credentials.
-
-    The analogue of coinbase.find_perp_portfolio_uuid: call it ONCE at signup
-    and store the result in participant_api_keys.portfolio_uuid, so the sync
-    never pays for the lookup.
-
-    Returns None if the key has no account, which is the normal answer for a
-    wallet that has never traded on Lighter.
-
-    Lighter reports that case as an ERROR (code 21100, "account not found")
-    rather than an empty list, so it's caught here and turned into None -
-    otherwise registering a wallet that hasn't been funded yet fails with an
-    opaque ExchangeError instead of something the participant can act on.
-
-    On the token path this costs no API call at all: the account index is a
-    field inside the token, and build_exchange_from_token has already put it
-    in options.
-    """
-    from_token = exchange.options.get('accountIndex')
-    if from_token is not None:
-        return from_token
-
-    try:
-        balance = exchange.fetch_balance()
-    except ccxt.ExchangeError as e:
-        if 'account not found' in str(e).lower() or '21100' in str(e):
-            logger.warning(
-                "No Lighter account for this wallet - it may not have "
-                "deposited yet. Address: %s",
-                exchange.eth_get_address_from_private_key(exchange.privateKey)
-            )
-            return None
-        raise
-
-    accounts = ((balance.get('info') or {}).get('accounts')) or []
-
-    if not accounts:
-        logger.warning("No Lighter account visible for these credentials")
-        return None
-
-    # A wallet can hold several sub-accounts. Take the first and say so
-    # rather than picking silently - the Coinbase equivalent of this once
-    # matched the wrong portfolio by name and valued the wrong account.
-    if len(accounts) > 1:
-        logger.warning(
-            "Lighter key has %d sub-accounts %s - using the first. Set "
-            "account_index explicitly if that's the wrong one.",
-            len(accounts),
-            [a.get('account_index') or a.get('index') for a in accounts],
-        )
-
-    first = accounts[0]
-    return first.get('account_index') or first.get('index')
+            f"Set {ENV_CREDENTIALS[ACCOUNT_TYPE]} in .env to use Lighter - a "
+            f"read-only token, which starts 'ro:'")
+    return build_exchange_from_token(token, encrypted=False)
 
 
 def get_account_totals_usdc(exchange: ccxt.Exchange, account_type: str = ACCOUNT_TYPE,
@@ -738,10 +562,6 @@ def _l1_address(exchange: ccxt.Exchange) -> str:
         address = accounts[0].get('l1_address')
         if address:
             return address
-
-    # Private-key path with no account yet: fall back to deriving it.
-    if getattr(exchange, 'privateKey', None):
-        return exchange.eth_get_address_from_private_key(exchange.privateKey)
 
     raise ValueError("No L1 address available for this Lighter account")
 
@@ -1060,7 +880,7 @@ if __name__ == "__main__":
 
     try:
         ex = exchange_from_env()
-        index = find_account_index(ex)
+        index = ex.options.get('accountIndex')
         totals = get_account_totals_usdc(ex, portfolio_uuid=index)
         orders = closed_orders(ex, portfolio_uuid=index)
         flows = get_cash_flows(ex, portfolio_uuid=index)
