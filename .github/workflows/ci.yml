@@ -75,6 +75,23 @@ jobs:
       - name: Install (lockfile must agree with package.json)
         run: npm ci
 
+      # Unlike the Python jobs, this one is NOT hermetic: app/layout.tsx
+      # imports Geist from next/font/google, which `next build` fetches from
+      # Google at build time. A fonts outage or rate-limit therefore reds this
+      # job for a reason unrelated to the commit. Caching .next/cache keeps
+      # the fetched fonts between runs, so the usual build does not reach the
+      # network at all - and speeds the build up besides.
+      #
+      # Keyed on the lockfile and invalidated by any source change, so a cache
+      # hit can never serve a stale build.
+      - name: Cache next build artifacts
+        uses: actions/cache@v4
+        with:
+          path: web/.next/cache
+          key: next-${{ hashFiles('web/package-lock.json') }}-${{ hashFiles('web/**/*.ts', 'web/**/*.tsx', 'web/**/*.css') }}
+          restore-keys: |
+            next-${{ hashFiles('web/package-lock.json') }}-
+
       # `next build` type-checks as part of the build, so this is the step
       # that catches a type error. Vercel runs exactly this.
       - name: Build
