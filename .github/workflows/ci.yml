@@ -51,6 +51,48 @@ jobs:
       - name: Test
         run: uv run pytest -q
 
+  web:
+    name: Frontend build (what Vercel runs)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # `npm ci` is the frontend's `uv lock --check`: it installs strictly
+      # from package-lock.json and FAILS when the lockfile disagrees with
+      # package.json, rather than quietly resolving something new. Same
+      # failure the Python job guards against, same reasoning - catching it
+      # here costs seconds, catching it on Vercel costs a deploy.
+      - name: Install (lockfile must agree with package.json)
+        run: npm ci
+
+      # `next build` type-checks as part of the build, so this is the step
+      # that catches a type error. Vercel runs exactly this.
+      - name: Build
+        run: npm run build
+
+      # Redundant with the build's own check in the normal case, and kept
+      # deliberately: it still fires if someone sets
+      # typescript.ignoreBuildErrors in next.config.ts.
+      #
+      # MUST run AFTER the build. Next generates the typed-routes files
+      # under .next/types during a build, and tsconfig includes that path -
+      # so on a fresh checkout, running tsc first fails with
+      # `Type '"/"' is not assignable to type 'never'` against
+      # app/layout.tsx's LayoutProps<"/">. The error points at the layout and
+      # has nothing to do with it; reordering these two steps reintroduces it.
+      - name: Typecheck
+        run: npx tsc --noEmit
+
   deploy-install:
     name: Production install (what Railway runs)
     runs-on: ubuntu-latest

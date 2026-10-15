@@ -35,7 +35,17 @@ types are JSDoc, which TypeScript honours in a `.js` file.
 | Variable | Notes |
 |---|---|
 | `NEXT_PUBLIC_SUPABASE_URL` | Project URL |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | The **anon** key. Public by design; RLS constrains it. |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | The **anon** key (or `sb_publishable_…`). Public by design; RLS constrains it. |
+| `NEXT_PUBLIC_COMPETITION_START` | *Optional.* Shown in the board header. |
+| `NEXT_PUBLIC_COMPETITION_END` | *Optional.* Same. |
+
+The two competition dates must match the backend's `COMPETITION_START` /
+`COMPETITION_END`, which `venue_common.py` reads from the environment and
+`metrics.py` scores against. Set them in one place and not the other and the
+board advertises a window the scorer is not using. Full timestamps are
+accepted — `2026-10-26T23:59:59Z` renders as `2026-10-26` — so the values can
+be copied verbatim from the backend. Unset falls back to the dates the page
+shipped with.
 
 Never set `SUPABASE_KEY` (service_role) or `FERNET_KEY` here. They decrypt
 every participant's exchange credentials and belong only to the backend.
