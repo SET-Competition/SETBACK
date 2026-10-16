@@ -1,0 +1,25 @@
+# Supabase CLI project config.
+#
+# Only the pieces this repository actually relies on are set here; everything
+# else is left to the CLI's defaults so this file does not drift into claiming
+# things nobody checks.
+
+# Lowercase deliberately: this is the LOCAL identifier, used as the Docker
+# Compose project name by `supabase start` - which rejects uppercase. It is
+# not the remote project ref; that comes from `supabase link --project-ref`.
+project_id = "set"
+
+[functions.register]
+# The signup form is public, so this endpoint must be callable with no
+# credential at all.
+#
+# Not, as an earlier version of this comment claimed, because submissions
+# would otherwise 401: the form sends the anon key as a bearer token and the
+# anon key IS a valid JWT, so verification would pass. The real effect is to
+# let anything call it, which is what a public registration endpoint needs.
+# Security-neutral either way - the key is in the bundle.
+#
+# Older Supabase CLI versions ignore this and need `--no-verify-jwt` at deploy
+# time. Nothing in CI validates this file, so check the deployed function's
+# setting in the dashboard rather than assuming it took.
+verify_jwt = false

@@ -146,19 +146,19 @@ def _reaches_anon(roles: str) -> bool:
     return "anon" in named or "public" in named
 
 
-def _covers_select(privileges: str) -> bool:
+def _covers(privileges: str, wanted: str) -> bool:
     """
-    `select (email)` counts. A column grant is narrower than a table grant,
-    but the property asserted here is that anon holds NOTHING on participants,
-    so treating it as a grant is overstrict only in the safe direction - and
-    `grant select (email) on public.participants to anon` was a live leak the
-    previous version waved through.
+    `select (email)` counts as select. A column grant is narrower than a table
+    grant, but the property asserted here is that anon holds NOTHING on these
+    tables, so treating it as a grant is overstrict only in the safe direction
+    - and `grant select (email) on public.participants to anon` was a live
+    leak an earlier version waved through.
     """
     privileges = re.sub(r"\s*\([^)]*\)", "", privileges)
     privileges = privileges.replace("privileges", "").strip()
     if privileges in ("all", ""):
         return True
-    return "select" in {p.strip() for p in privileges.split(",")}
+    return wanted in {p.strip() for p in privileges.split(",")}
 
 
 def _targets(target: str, table: str) -> bool:
@@ -179,8 +179,10 @@ _GRANT = re.compile(
 )
 
 
-def _anon_select_effective(statements: list[str], table: str, *, default: bool) -> bool:
-    """Whether anon can SELECT `table` once the whole file has run."""
+def _anon_effective(
+    statements: list[str], table: str, privilege: str, *, default: bool
+) -> bool:
+    """Whether anon holds `privilege` on `table` once the whole file has run."""
     state = default
     for statement in statements:
         match = _GRANT.match(statement)
@@ -188,7 +190,7 @@ def _anon_select_effective(statements: list[str], table: str, *, default: bool) 
             continue  # revoking the grant OPTION leaves the privilege itself
         if not _targets(match.group("target"), table):
             continue
-        if not _covers_select(match.group("privileges")):
+        if not _covers(match.group("privileges"), privilege):
             continue
         if not _reaches_anon(match.group("roles")):
             continue
@@ -229,9 +231,10 @@ _DROP_POLICY = re.compile(
 )
 
 
-def _surviving_select_policies(statements: list[str], table: str) -> list[str]:
+def _surviving_policies(statements: list[str], table: str, command: str) -> list[str]:
     """
-    Policy names that let anon SELECT `table` once the file has finished.
+    Policy names that let anon run `command` on `table` once the file has
+    finished.
 
     The body is cut at `using` / `with check` before anything is read from it.
     Without that, the first `for` or `to` ANYWHERE won - including inside a
@@ -256,9 +259,9 @@ def _surviving_select_policies(statements: list[str], table: str) -> list[str]:
         if "as restrictive" in head:
             continue  # restrictive policies narrow access, they never grant it
 
-        # No FOR clause means FOR ALL, which includes SELECT.
-        command = re.search(r"\bfor\s+(all|select|insert|update|delete)\b", head)
-        if command and command.group(1) not in ("all", "select"):
+        # No FOR clause means FOR ALL, which includes every command.
+        declared = re.search(r"\bfor\s+(all|select|insert|update|delete)\b", head)
+        if declared and declared.group(1) not in ("all", command):
             continue
 
         # No TO clause means PUBLIC.
@@ -338,8 +341,8 @@ def test_the_leaderboard_view_is_readable_by_anon():
     Starts from `default=False`: a grant on this view has to be explicit, not
     inherited from whatever Supabase did to the public schema.
     """
-    assert _anon_select_effective(
-        _statements(SCHEMA), "public.leaderboard", default=False
+    assert _anon_effective(
+        _statements(SCHEMA), "public.leaderboard", "select", default=False
     ), (
         "After schema.sql runs, anon cannot select public.leaderboard.\n"
         "The live board then falls back to MOCK_ROWS and serves invented "
@@ -369,7 +372,7 @@ def test_anon_cannot_read_participant_email():
         "Check for a later `disable row level security`."
     )
 
-    leaks = _surviving_select_policies(statements, "public.participants")
+    leaks = _surviving_policies(statements, "public.participants", "select")
     assert not leaks, (
         f"Policies {leaks} let anon select public.participants, which "
         "publishes every participant's email address.\n"
@@ -380,10 +383,54 @@ def test_anon_cannot_read_participant_email():
         'what the original "leaderboard is readable" policy got wrong.'
     )
 
-    assert not _anon_select_effective(statements, "public.participants", default=True), (
+    assert not _anon_effective(statements, "public.participants", "select", default=True), (
         "After schema.sql runs, anon holds select on public.participants, so "
         "every participant's email is readable over PostgREST.\n"
         "Supabase grants this by default, so the revoke must be explicit - and "
         "must not be undone by a later grant, including a column grant such as "
         "`grant select (email) on public.participants to anon`."
     )
+
+
+def test_anon_cannot_write_signups_directly():
+    """
+    The rate limit is only a limit if the Edge Function is the only entrance.
+
+    anon used to hold `insert` on pending_signups, under a policy named
+    "anon submits a signup", and that is precisely why nothing rate-limited
+    the form: the write went from the visitor's browser to PostgREST without
+    passing through anything we run. Cloudflare and Vercel sit in front of the
+    WEBSITE, and the website was not on the path - so there was no point at
+    which to count requests, whatever was bought or configured.
+
+    Submissions now go through supabase/functions/register/index.ts, which
+    holds the service role inside Supabase and checks record_signup_attempt
+    first. Re-granting insert here would not break anything visibly: the form
+    would keep working, and the limit would quietly become optional for anyone
+    who reads the bundle. That is the regression this pins.
+
+    Starts from `default=True`, like participants: Supabase default-grants on
+    the public schema, so the revoke has to be explicit.
+    """
+    statements = _statements(SCHEMA)
+
+    assert not _anon_effective(
+        statements, "public.pending_signups", "insert", default=True
+    ), (
+        "anon can insert into public.pending_signups, so the browser can reach "
+        "the table directly and the rate limit in migrations/003 is bypassable "
+        "by anyone who reads the anon key out of the JS bundle.\n"
+        "Submissions are meant to go through the register Edge Function."
+    )
+
+    leaks = _surviving_policies(statements, "public.pending_signups", "insert")
+    assert not leaks, (
+        f"Policies {leaks} let anon insert into public.pending_signups, "
+        "re-opening the unrated path the Edge Function replaced."
+    )
+
+    # The table still holds plaintext credentials until the importer runs, so
+    # the read side matters as much as it ever did.
+    assert not _anon_effective(
+        statements, "public.pending_signups", "select", default=True
+    ), "anon can select public.pending_signups, which holds plaintext credentials."

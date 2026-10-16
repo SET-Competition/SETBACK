@@ -28,3 +28,6 @@ main.py
 
 # macOS
 .DS_Store
+
+# Supabase CLI scratch (version cache, linked-project ref)
+supabase/.temp/

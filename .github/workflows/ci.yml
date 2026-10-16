@@ -110,6 +110,44 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit
 
+  edge-functions:
+    name: Edge functions (what Supabase runs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The register function is the only way into pending_signups, so it is
+      # the only thing between an open form and a table of plaintext exchange
+      # credentials. It runs on Deno inside Supabase, which neither of the
+      # other jobs exercises: ruff does not read TypeScript, and the web job
+      # builds Next, which never imports this file.
+      - name: Install Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # Every step runs from supabase/functions, because Deno discovers
+      # deno.json by walking up from the WORKING DIRECTORY rather than from
+      # the file it is checking. Passing paths from the repository root finds
+      # no config and fails with "@std/assert not a dependency".
+      - name: Typecheck
+        working-directory: supabase/functions
+        run: deno check register/index.ts register/index_test.ts
+
+      - name: Lint
+        working-directory: supabase/functions
+        run: deno lint .
+
+      - name: Dependencies match the lockfile
+        working-directory: supabase/functions
+        run: deno install --frozen
+
+      - name: Test
+        working-directory: supabase/functions
+        # --allow-env and nothing else. The tests stub fetch, so granting net
+        # access would mean a test could quietly reach a real database.
+        run: deno test --allow-env .
+
   deploy-install:
     name: Production install (what Railway runs)
     runs-on: ubuntu-latest
