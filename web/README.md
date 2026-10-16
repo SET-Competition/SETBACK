@@ -66,20 +66,21 @@ Without them the leaderboard renders sample rows and says so in a banner — see
 to submit, for the same reason: a page that silently does nothing is worse than
 one that says what is missing.
 
-## Before the live board works
+## What the anon key reaches
 
-`migrations/schema.sql` ends with `revoke all on public.leaderboard from anon`,
-so the anon key cannot read the view yet. Either grant it —
+`migrations/schema.sql` grants anon `select` on the `leaderboard` view and
+`insert` on `pending_signups`, and nothing else. Those two are the whole
+surface the browser needs: the board is read directly, and `/register` posts
+with `Prefer: return=minimal` so it never reads anything back.
 
-```sql
-grant select on public.leaderboard to anon;
-```
+If the board shows sample data under a banner saying **permission denied for
+view leaderboard**, that grant is missing — the database predates
+`migrations/002_public_leaderboard_and_participant_privacy.sql`, or a re-run
+of an older `schema.sql` revoked it. Run 002; it is idempotent.
 
-— which the schema's own comments call safe, since the view carries no email
-and no key material, or add Supabase Auth and keep it to `authenticated`.
-
-`/register` needs no such grant: RLS already gives anon `insert` on
-`pending_signups`, and deliberately no `select`.
+Treat that banner as a bug, not as setup. `tests/test_schema_grants.py` exists
+to stop the grant being lost again, because the symptom is a public ranking
+full of invented traders rather than an error anyone would notice.
 
 ## Deploying to set-global.com
 

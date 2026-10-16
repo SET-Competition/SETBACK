@@ -1047,17 +1047,57 @@ drop policy if exists "participants read own trades"    on public.trade_metrics;
 drop policy if exists "participants read own snapshots" on public.balance_snapshots;
 drop policy if exists "leaderboard is readable"         on public.participants;
 
+-- `to authenticated` is not decoration. Without it these name no role, which
+-- means PUBLIC, which includes anon - the same shape as the
+-- "leaderboard is readable" policy removed above. They happen not to leak,
+-- because auth.uid() is NULL for anon and `participant_id = null` is null
+-- rather than true, but that is an accident of the comparison rather than a
+-- boundary, and it would stop being true the moment either predicate gained
+-- an `or`.
 create policy "participants read own trades"
   on public.trade_metrics for select
+  to authenticated
   using (participant_id = auth.uid());
 
 create policy "participants read own snapshots"
   on public.balance_snapshots for select
+  to authenticated
   using (participant_id = auth.uid());
 
-create policy "leaderboard is readable"
-  on public.participants for select
-  using (true);
+-- There is deliberately NO select policy on public.participants.
+--
+-- One used to live here, named "leaderboard is readable" and written
+-- `for select using (true)` with no `to` clause - so it applied to anon, and
+-- every participant's EMAIL ADDRESS was readable over PostgREST by anyone who
+-- lifted the key out of the JS bundle.
+--
+-- It never did what its name claimed. The leaderboard is a VIEW, and section
+-- 12 below explains that a view runs with its owner's privileges rather than
+-- the caller's - so it reads this table regardless of RLS. The policy bought
+-- the leaderboard nothing and cost every participant their email.
+-- ALL, not just select: Supabase default-grants every privilege on
+-- public-schema tables, so narrowing this to `select` would leave anon
+-- holding insert/update/delete, stopped only by RLS-with-no-policy. The rest
+-- of this file uses the broad form for exactly that reason.
+revoke all on public.participants from anon;
+
+-- Every other table, for the same reason.
+--
+-- RLS with no matching policy already returns zero rows, and that is what was
+-- standing between anon and these until now - one layer, on tables holding
+-- encrypted exchange credentials and every participant's trade history. The
+-- grant is what makes a policy reachable at all, so taking it away means a
+-- future `create policy ... using (true)`, the exact mistake this file has
+-- already made once, cannot open anything on its own.
+--
+-- pending_signups is absent deliberately: anon MUST keep insert there, and
+-- its other verbs are revoked individually above.
+revoke all on public.participant_api_keys from anon;
+revoke all on public.trade_metrics        from anon;
+revoke all on public.balance_snapshots    from anon;
+revoke all on public.fetch_errors         from anon;
+revoke all on public.cash_flows           from anon;
+revoke all on public.participant_scores   from anon;
 
 
 -- ---------------------------------------------------------------------------
@@ -1067,18 +1107,32 @@ create policy "leaderboard is readable"
 -- owner's privileges, so latest_balances bypasses every policy above — which
 -- is why Supabase labels it "Unrestricted".
 --
--- Default below: logged-in participants see the leaderboard, the public
--- internet does not. To make it fully public instead, grant to anon as well.
+-- Below: the leaderboard view is public (anon), because the ranking is a
+-- public page. daily_balances is not - it carries every participant's full
+-- per-day equity curve, which the ranking does not need and which nothing
+-- outside score.py reads.
+--
+-- latest_balances is revoked from anon too, but be clear that this protects
+-- nothing on its own: leaderboard selects spot_usdc, perp_usdc, total_usdc
+-- and as_of from it, which is every column it has that is not already on
+-- participants - so the public view is a strict SUPERSET of this one and
+-- anon can reconstruct it exactly. The revoke is tidiness, not a boundary.
+-- The boundary that matters is the one below it.
 -- ---------------------------------------------------------------------------
 
 revoke all on public.latest_balances from anon;
 grant select on public.latest_balances to authenticated;
 
 -- The leaderboard carries no email, no key material and no per-trade detail -
--- only display_name and a score - so it is the one view that could safely be
--- made public. Granted to `authenticated` by default; add `anon` to turn it
--- into a public JSON endpoint over PostgREST with no frontend at all.
-revoke all on public.leaderboard from anon;
+-- only display_name, scores and balances - so it is the one view that is
+-- safe to make public, and it IS public: the competition ranking is a public
+-- web page, read straight from the browser with the anon key.
+--
+-- This grant is load-bearing. Without it web/lib/leaderboard.ts falls back to
+-- MOCK_ROWS and the live site serves five invented traders under a "sample
+-- data" banner, which is a worse failure than an error page. Revoking it to
+-- close the board is a deliberate act, not a default.
+grant select on public.leaderboard to anon;
 grant select on public.leaderboard to authenticated;
 
 -- daily_balances is revoked from BOTH roles, unlike the two views above.

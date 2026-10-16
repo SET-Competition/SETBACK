@@ -139,11 +139,23 @@ def score_participant(participant_id: str, period: str,
         # registered in the last few days - not an error, just an answer.
         row["unreliable_reason"] = str(e)
         return row
-    except Exception as e:
+    except Exception:
         # Anything else is a real bug, but it must cost one participant their
         # score rather than the whole run's.
+        #
+        # The exception text stays in the log and out of the row. This column
+        # is carried by the public leaderboard view, so whatever lands here is
+        # served to the internet - and an unplanned exception from deep in
+        # metrics.py goes through supabase-py and httpx, whose messages quote
+        # the project URL, table and column names, and PostgREST error detail.
+        # The ValueError branch above is safe to publish because metrics.py
+        # writes those strings deliberately, mostly for participants to read.
+        # One is addressed to whoever runs this - the milliseconds check in
+        # metrics.py - and names a column of ours, which is a schema detail in
+        # a public repository rather than anything actionable, so it stays.
+        # This branch is not written for anybody.
         logger.exception("Scoring %s (%s) failed", participant_id, period)
-        row["unreliable_reason"] = f"scoring failed: {type(e).__name__}: {e}"
+        row["unreliable_reason"] = "scoring failed - see the sync log"
         return row
 
     for key, column in _RESULT_COLUMNS.items():
