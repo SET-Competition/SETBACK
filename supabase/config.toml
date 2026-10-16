@@ -1,0 +1,13 @@
+# Supabase CLI project config.
+#
+# Only the pieces this repository actually relies on are set here; everything
+# else is left to the CLI's defaults so this file does not drift into claiming
+# things nobody checks.
+
+project_id = "SET"
+
+[functions.register]
+# The signup form is public, so callers have no JWT. Without this the platform
+# rejects every submission with 401 before the function runs, which looks
+# exactly like a broken form.
+verify_jwt = false

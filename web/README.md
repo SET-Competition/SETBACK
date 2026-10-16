@@ -69,9 +69,12 @@ one that says what is missing.
 ## What the anon key reaches
 
 `migrations/schema.sql` grants anon `select` on the `leaderboard` view and
-`insert` on `pending_signups`, and nothing else. Those two are the whole
-surface the browser needs: the board is read directly, and `/register` posts
-with `Prefer: return=minimal` so it never reads anything back.
+nothing else. That is the whole surface the browser needs for reading.
+
+`/register` does not write with the anon key at all. It posts to the
+`register` Edge Function (`supabase/functions/register/index.ts`), which holds
+the service role inside Supabase and rate-limits by IP — the browser never
+touches `pending_signups` directly, which is what makes the limit meaningful.
 
 If the board shows sample data under a banner saying **permission denied for
 view leaderboard**, that grant is missing — the database predates

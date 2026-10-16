@@ -1,0 +1,18 @@
+{
+  // Shared by every function in this directory.
+  //
+  // The register function itself imports NOTHING. It speaks to PostgREST with
+  // fetch, because the one piece of this system that handles plaintext
+  // exchange credentials in transit should not have a supply chain. This map
+  // exists for index_test.ts alone, which needs an assertion library.
+  //
+  // Declared here rather than inlined in the import so the version is pinned
+  // in one place, and so `deno lint`'s no-import-prefix rule passes.
+  //
+  // Deno discovers this by walking up from the working directory, NOT from
+  // the file being checked - so commands must run with this directory as cwd.
+  // CI does; see the edge-functions job in .github/workflows/ci.yml.
+  "imports": {
+    "@std/assert": "jsr:@std/assert@1.0.8"
+  }
+}

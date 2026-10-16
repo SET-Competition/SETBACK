@@ -24,14 +24,20 @@ import { buildRows, venueLabel } from "@/lib/signup";
  * sign_ups.py often; that window is the whole exposure. See the warning at the
  * top of section 8 in migrations/schema.sql.
  *
- * The anon key is compiled into the bundle, which is fine: RLS grants anon
- * INSERT on this one table and nothing else, so the key can add rows and can
- * neither read one back nor reach any other table.
+ * The anon key is compiled into the bundle, which is fine and is now fine for
+ * a stronger reason than it used to be: anon can SELECT the leaderboard view
+ * and nothing else at all. It cannot write here either. Submissions go to the
+ * register Edge Function, which holds the service role inside Supabase.
  */
 
-// Rendered on the client, where fetch() talks to Supabase directly. There is no
-// server step to add, because there is nothing a server could hide - the anon
-// key is public by design.
+// Rendered on the client, but the submission no longer goes to the database
+// from here - it goes to an Edge Function (see the handler below).
+//
+// An earlier version of this comment said there was no server step to add
+// "because there is nothing a server could hide". That was true and beside
+// the point: the reason to add one was never secrecy, it was having somewhere
+// to count requests. A write that goes straight from a visitor's browser to
+// PostgREST cannot be rate-limited by anything we control.
 //
 // Both must be referenced as a full `process.env.NAME` expression: Next inlines
 // the value by literal substitution at build time, so destructuring or indexing
@@ -167,38 +173,67 @@ export default function RegisterForm() {
     });
 
     try {
-      // One request, one row per venue. PostgREST inserts a JSON array as
-      // multiple rows, and it is a single statement - so either every venue is
-      // registered or none is, and a participant never ends up half-submitted.
-      const response = await fetch(`${SUPABASE_URL}/rest/v1/pending_signups`, {
+      // Posted to the `register` Edge Function, NOT to PostgREST.
+      //
+      // The browser used to insert into pending_signups directly, which is
+      // why nothing rate-limited this form: the write never touched the
+      // website, so there was no edge to put a limit at, and the anon key
+      // needed to do it is readable in this bundle by design. The function
+      // runs inside Supabase with the service role, sees the caller's
+      // address, and is the only thing that can write to that table once
+      // migrations/004 has run. See supabase/functions/register/index.ts.
+      //
+      // Still one request carrying one row per venue, and still a single
+      // insert statement on the far side - so either every venue is
+      // registered or none is, and nobody ends up half-submitted.
+      const response = await fetch(`${SUPABASE_URL}/functions/v1/register`, {
         method: "POST",
         headers: {
+          // The function itself requires no auth (verify_jwt = false), but
+          // Supabase's gateway routes on this header.
           apikey: SUPABASE_ANON_KEY,
           Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
           "Content-Type": "application/json",
-          Prefer: "return=minimal",
         },
         body: JSON.stringify(rows),
       });
 
       if (!response.ok) {
-        // The response BODY is deliberately never shown, and never logged.
+        // Unlike the PostgREST version this replaced, the body here is SAFE
+        // to show, and that is a deliberate property of the function rather
+        // than an assumption about it.
         //
-        // PostgREST returns PostgreSQL's DETAIL, and for a check-constraint
+        // PostgREST returned PostgreSQL's DETAIL, and for a check-constraint
         // violation that is `Failing row contains (...)` - the entire row,
-        // api_key and api_secret included. Rendering it would print the
+        // api_key and api_secret included. Rendering it printed the
         // participant's private key on screen, where it lands in any
-        // screenshot they send the organiser. Bounding how long that
-        // plaintext is visible is the property this whole design turns on.
+        // screenshot they send the organiser.
         //
-        // The status code alone is safe, and is what an organiser needs to
-        // tell a rejected key from an outage.
+        // The function never passes a PostgREST body back. It logs those and
+        // returns a message it composed itself, so the text below is ours.
+        // It is still read defensively: a string, length-capped, and only
+        // when the shape is what we expect - because the alternative is
+        // trusting a response to decide what to paint on a page that has
+        // credentials on it.
+        let detail = "";
+        try {
+          const body = await response.json();
+          if (body && typeof body.error === "string") {
+            detail = ` ${body.error.slice(0, 200)}`;
+          }
+        } catch {
+          // No JSON body - a gateway error, or the function never ran.
+        }
+
         setStatus({
           kind: "error",
           message:
-            `Could not submit — the server rejected the request ` +
-            `(HTTP ${response.status}). Check your entries and try again, or ` +
-            `contact the organiser with that code.`,
+            response.status === 429
+              ? `Too many submissions from your network.${detail} ` +
+                "Wait an hour and try again, or contact the organiser."
+              : `Could not submit — the server rejected the request ` +
+                `(HTTP ${response.status}).${detail} Check your entries and ` +
+                `try again, or contact the organiser with that code.`,
         });
         return;
       }

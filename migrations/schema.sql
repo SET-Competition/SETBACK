@@ -1022,24 +1022,24 @@ alter table public.cash_flows           enable row level security;
 alter table public.participant_scores   enable row level security;
 alter table public.pending_signups      enable row level security;
 
--- The ONE place anon is allowed to write.
+-- anon writes NOTHING here, and that is a change from how this started.
 --
--- Insert and nothing else: there is deliberately no select policy, so a
--- submitter cannot read back their own row, cannot read anyone else's, and
--- cannot use the endpoint to test whether an email is already registered.
+-- A browser used to insert into this table directly, under a policy named
+-- "anon submits a signup". It worked, and it is why nothing rate-limited the
+-- form: the write went from the visitor's browser to PostgREST without
+-- passing through anything we run, so there was no point at which to count
+-- requests. Cloudflare and Vercel both sit in front of the WEBSITE, and the
+-- website is not on the path.
 --
--- The grant is stated explicitly rather than relying on whatever Supabase
--- has granted on the public schema, and the other verbs are revoked, because
--- "anon can only insert" is the property this entire table depends on.
+-- Signups now arrive through the `register` Edge Function, which runs inside
+-- this project with the service role, sees the caller's address, and checks
+-- record_signup_attempt before inserting. The service role bypasses RLS and
+-- grants, so it needs nothing here; anon needs nothing here either, and
+-- having nothing is what makes the limit a limit rather than a suggestion.
+--
+-- See migrations/003 and 004, and supabase/functions/register/index.ts.
 drop policy if exists "anon submits a signup" on public.pending_signups;
-create policy "anon submits a signup"
-  on public.pending_signups
-  for insert
-  to anon
-  with check (true);
-
-grant insert on public.pending_signups to anon;
-revoke select, update, delete on public.pending_signups from anon;
+revoke all on public.pending_signups from anon;
 revoke all on public.pending_signups from authenticated;
 
 

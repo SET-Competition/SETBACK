@@ -190,22 +190,35 @@ plaintext never lands at all.
 `FERNET_KEY` itself, and shipping that to every visitor would expose the key
 protecting every credential already stored.
 
-**What the anon key can do.** Two things. Insert one row into
-`pending_signups`, and select the `leaderboard` view — the public ranking is
-read straight from the browser.
+**What the anon key can do.** One thing: select the `leaderboard` view. The
+public ranking is read straight from the browser; everything else is revoked.
 
-On `pending_signups` it has no `select` policy, so a submitter can't read their
-row back, can't read anyone else's, and can't use the endpoint to probe whether
-an email is registered. The `leaderboard` view carries display names, scores
-and balances; `participants`, which carries email, is revoked from anon and has
-no policy, so the addresses are not reachable.
+Signups used to be the second thing — anon held `insert` on `pending_signups`
+— and that is exactly why nothing rate-limited the form. The write went from
+the visitor's browser to PostgREST without passing through anything we run, so
+Cloudflare and Vercel, which sit in front of the *website*, were never on the
+path. Submissions now go to the `register` Edge Function, which runs inside
+Supabase with the service role, sees the caller's address and checks
+`record_signup_attempt` before inserting. See `migrations/003` and `004`.
+
+A submitter still cannot read anything back: not their own row, not anyone
+else's, and not whether an email is already registered. The `leaderboard` view
+carries display names, scores and balances; `participants`, which carries
+email, is revoked and has no policy, so addresses are unreachable.
 Verified against real PostgreSQL, along with a check constraint that refuses
 to let a resolved row keep a credential — so the plaintext is destroyed on
 import even if the importer has a bug.
 
-**What it doesn't do.** Nothing rate-limits submissions. Sizes are bounded, but
-volume isn't; put Supabase's rate limiting or a captcha in front of the form
-before advertising it publicly.
+**Rate limiting.** Five submissions per IP per hour, counted and recorded in
+one statement by `record_signup_attempt` so two simultaneous requests cannot
+both pass a limit of one. Blocked attempts are deliberately NOT recorded — a
+flood that extended its own window would turn a rate limit into a permanent
+ban for everyone behind a NAT, a campus or a phone network. Tune with
+`SIGNUP_MAX_ATTEMPTS` and `SIGNUP_WINDOW` on the function, no redeploy needed.
+
+A determined attacker with addresses to spend still gets through; this bounds
+casual abuse of an open form, which is what it is for. A captcha is the next
+step if it ever needs one.
 
 Verification is asynchronous, so someone who submits a trade-capable key finds
 out later. The reason is stored in `pending_signups.last_error`, and transient
