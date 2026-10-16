@@ -9,9 +9,10 @@ export const metadata: Metadata = {
 };
 
 // The board only changes when the sync runs, and the sync is a Railway cron
-// service - three-hourly at the time of writing - so its cadence is not
-// something this repo can state and keep true. An earlier version of this
-// comment said "hourly" and was wrong within a week.
+// service whose schedule lives in Railway's UI, not here - so any interval
+// written down in this repository is a claim the code cannot keep true. An
+// earlier version of this comment said "hourly" and was wrong within a week,
+// which is why this one names no number.
 //
 // Five minutes is well inside any plausible schedule. It is not chosen to
 // match the cron: it bounds how long a MANUAL run, or a change to the

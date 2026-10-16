@@ -1,10 +1,14 @@
 -- ---------------------------------------------------------------------------
--- 002 — Make the leaderboard public, and stop anon reading participant email
+-- 002 — Make the leaderboard public, and shut the anon key out of everything
+--       except the two things the website actually needs
 --
--- Two problems that only appear once a real person registers, both of which
--- schema.sql reintroduces every time it is re-run. Fixed here AND in
--- schema.sql; this file exists so a database already created from the old
--- schema can be corrected without a full re-run.
+-- Steps 1 and 2 are two problems that only appear once a real person
+-- registers, both of which schema.sql reintroduced every time it was re-run.
+-- Steps 3 and 4 take away the grants and widen the policies that made the
+-- second one reachable in the first place.
+--
+-- Fixed here AND in schema.sql; this file exists so a database already
+-- created from the old schema can be corrected without a full re-run.
 --
 -- Safe to run more than once.
 -- ---------------------------------------------------------------------------
@@ -43,6 +47,42 @@ drop policy if exists "leaderboard is readable" on public.participants;
 -- table grant is what made the policy reachable, so remove that too.
 revoke all on public.participants from anon;
 
+-- 3. Every other table kept Supabase's default grants.
+--
+-- RLS with no matching policy already returns zero rows, which is what was
+-- standing between anon and these - one layer, on tables holding encrypted
+-- exchange credentials and every participant's trade history. The grant is
+-- what makes a policy reachable, so removing it means a future
+-- `create policy ... using (true)` - the exact mistake fixed in step 2 -
+-- cannot open anything by itself.
+--
+-- pending_signups is absent deliberately: anon MUST keep insert there.
+revoke all on public.participant_api_keys from anon;
+revoke all on public.trade_metrics        from anon;
+revoke all on public.balance_snapshots    from anon;
+revoke all on public.fetch_errors         from anon;
+revoke all on public.cash_flows           from anon;
+revoke all on public.participant_scores   from anon;
+
+-- 4. Two policies that name no role, and so apply to PUBLIC including anon.
+--
+-- They do not leak today, because auth.uid() is NULL for anon and
+-- `participant_id = null` is null rather than true - an accident of the
+-- comparison, not a boundary, and one that stops holding the moment either
+-- predicate gains an `or`. Same shape as the policy dropped in step 2.
+drop policy if exists "participants read own trades"    on public.trade_metrics;
+drop policy if exists "participants read own snapshots" on public.balance_snapshots;
+
+create policy "participants read own trades"
+  on public.trade_metrics for select
+  to authenticated
+  using (participant_id = auth.uid());
+
+create policy "participants read own snapshots"
+  on public.balance_snapshots for select
+  to authenticated
+  using (participant_id = auth.uid());
+
 commit;
 
 -- Confirmation: the SQL editor shows the last statement's result.
@@ -50,6 +90,10 @@ commit;
 --   leaderboard_public        t   anon can read the board
 --   participants_readable     f   anon cannot read emails
 --   participants_policies     0   no policy left to re-open it
+--
+-- participants_policies is 0 today because participants needs no policy at
+-- all. If a legitimate `authenticated`-scoped one is ever added, that number
+-- becomes 1 and this note is what says so was expected.
 --   views_owned_by            one row per object, all the same owner
 --
 -- has_table_privilege rather than information_schema.role_table_grants:
@@ -73,5 +117,6 @@ select
     where schemaname = 'public' and tablename = 'participants')  as participants_policies,
   (select string_agg(relname || '=' || relowner::regrole::text, ', ' order by relname)
      from pg_class
-    where relname in ('participants', 'leaderboard', 'latest_balances'))
+    where relnamespace = 'public'::regnamespace
+      and relname in ('participants', 'leaderboard', 'latest_balances'))
                                                                  as views_owned_by;

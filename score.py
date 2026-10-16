@@ -148,9 +148,12 @@ def score_participant(participant_id: str, period: str,
         # served to the internet - and an unplanned exception from deep in
         # metrics.py goes through supabase-py and httpx, whose messages quote
         # the project URL, table and column names, and PostgREST error detail.
-        # The ValueError branch above is safe to publish because those strings
-        # are written by metrics.py for participants to read; this one is not
-        # written for anybody.
+        # The ValueError branch above is safe to publish because metrics.py
+        # writes those strings deliberately, mostly for participants to read.
+        # One is addressed to whoever runs this - the milliseconds check in
+        # metrics.py - and names a column of ours, which is a schema detail in
+        # a public repository rather than anything actionable, so it stays.
+        # This branch is not written for anybody.
         logger.exception("Scoring %s (%s) failed", participant_id, period)
         row["unreliable_reason"] = "scoring failed - see the sync log"
         return row

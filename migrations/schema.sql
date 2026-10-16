@@ -1047,12 +1047,21 @@ drop policy if exists "participants read own trades"    on public.trade_metrics;
 drop policy if exists "participants read own snapshots" on public.balance_snapshots;
 drop policy if exists "leaderboard is readable"         on public.participants;
 
+-- `to authenticated` is not decoration. Without it these name no role, which
+-- means PUBLIC, which includes anon - the same shape as the
+-- "leaderboard is readable" policy removed above. They happen not to leak,
+-- because auth.uid() is NULL for anon and `participant_id = null` is null
+-- rather than true, but that is an accident of the comparison rather than a
+-- boundary, and it would stop being true the moment either predicate gained
+-- an `or`.
 create policy "participants read own trades"
   on public.trade_metrics for select
+  to authenticated
   using (participant_id = auth.uid());
 
 create policy "participants read own snapshots"
   on public.balance_snapshots for select
+  to authenticated
   using (participant_id = auth.uid());
 
 -- There is deliberately NO select policy on public.participants.
@@ -1071,6 +1080,24 @@ create policy "participants read own snapshots"
 -- holding insert/update/delete, stopped only by RLS-with-no-policy. The rest
 -- of this file uses the broad form for exactly that reason.
 revoke all on public.participants from anon;
+
+-- Every other table, for the same reason.
+--
+-- RLS with no matching policy already returns zero rows, and that is what was
+-- standing between anon and these until now - one layer, on tables holding
+-- encrypted exchange credentials and every participant's trade history. The
+-- grant is what makes a policy reachable at all, so taking it away means a
+-- future `create policy ... using (true)`, the exact mistake this file has
+-- already made once, cannot open anything on its own.
+--
+-- pending_signups is absent deliberately: anon MUST keep insert there, and
+-- its other verbs are revoked individually above.
+revoke all on public.participant_api_keys from anon;
+revoke all on public.trade_metrics        from anon;
+revoke all on public.balance_snapshots    from anon;
+revoke all on public.fetch_errors         from anon;
+revoke all on public.cash_flows           from anon;
+revoke all on public.participant_scores   from anon;
 
 
 -- ---------------------------------------------------------------------------
