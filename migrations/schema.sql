@@ -1055,9 +1055,18 @@ create policy "participants read own snapshots"
   on public.balance_snapshots for select
   using (participant_id = auth.uid());
 
-create policy "leaderboard is readable"
-  on public.participants for select
-  using (true);
+-- There is deliberately NO select policy on public.participants.
+--
+-- One used to live here, named "leaderboard is readable" and written
+-- `for select using (true)` with no `to` clause - so it applied to anon, and
+-- every participant's EMAIL ADDRESS was readable over PostgREST by anyone who
+-- lifted the key out of the JS bundle.
+--
+-- It never did what its name claimed. The leaderboard is a VIEW, and section
+-- 12 below explains that a view runs with its owner's privileges rather than
+-- the caller's - so it reads this table regardless of RLS. The policy bought
+-- the leaderboard nothing and cost every participant their email.
+revoke select on public.participants from anon;
 
 
 -- ---------------------------------------------------------------------------
@@ -1067,18 +1076,24 @@ create policy "leaderboard is readable"
 -- owner's privileges, so latest_balances bypasses every policy above — which
 -- is why Supabase labels it "Unrestricted".
 --
--- Default below: logged-in participants see the leaderboard, the public
--- internet does not. To make it fully public instead, grant to anon as well.
+-- Below: the leaderboard view is public (anon), because the ranking is a
+-- public page. latest_balances and daily_balances are not - they expose
+-- per-venue and per-day equity, which the ranking does not need.
 -- ---------------------------------------------------------------------------
 
 revoke all on public.latest_balances from anon;
 grant select on public.latest_balances to authenticated;
 
 -- The leaderboard carries no email, no key material and no per-trade detail -
--- only display_name and a score - so it is the one view that could safely be
--- made public. Granted to `authenticated` by default; add `anon` to turn it
--- into a public JSON endpoint over PostgREST with no frontend at all.
-revoke all on public.leaderboard from anon;
+-- only display_name, scores and balances - so it is the one view that is
+-- safe to make public, and it IS public: the competition ranking is a public
+-- web page, read straight from the browser with the anon key.
+--
+-- This grant is load-bearing. Without it web/lib/leaderboard.ts falls back to
+-- MOCK_ROWS and the live site serves five invented traders under a "sample
+-- data" banner, which is a worse failure than an error page. Revoking it to
+-- close the board is a deliberate act, not a default.
+grant select on public.leaderboard to anon;
 grant select on public.leaderboard to authenticated;
 
 -- daily_balances is revoked from BOTH roles, unlike the two views above.
