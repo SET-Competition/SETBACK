@@ -190,9 +190,15 @@ plaintext never lands at all.
 `FERNET_KEY` itself, and shipping that to every visitor would expose the key
 protecting every credential already stored.
 
-**What the anon key can do.** Insert one row into `pending_signups`. It has no
-`select` policy, so a submitter can't read their row back, can't read anyone
-else's, and can't use the endpoint to probe whether an email is registered.
+**What the anon key can do.** Two things. Insert one row into
+`pending_signups`, and select the `leaderboard` view — the public ranking is
+read straight from the browser.
+
+On `pending_signups` it has no `select` policy, so a submitter can't read their
+row back, can't read anyone else's, and can't use the endpoint to probe whether
+an email is registered. The `leaderboard` view carries display names, scores
+and balances; `participants`, which carries email, is revoked from anon and has
+no policy, so the addresses are not reachable.
 Verified against real PostgreSQL, along with a check constraint that refuses
 to let a resolved row keep a credential — so the plaintext is destroyed on
 import even if the importer has a bug.

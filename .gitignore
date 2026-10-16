@@ -25,3 +25,6 @@ main.py
 # Tooling caches
 .ruff_cache/
 .pytest_cache/
+
+# macOS
+.DS_Store

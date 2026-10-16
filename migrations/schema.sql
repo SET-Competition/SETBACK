@@ -1066,7 +1066,11 @@ create policy "participants read own snapshots"
 -- 12 below explains that a view runs with its owner's privileges rather than
 -- the caller's - so it reads this table regardless of RLS. The policy bought
 -- the leaderboard nothing and cost every participant their email.
-revoke select on public.participants from anon;
+-- ALL, not just select: Supabase default-grants every privilege on
+-- public-schema tables, so narrowing this to `select` would leave anon
+-- holding insert/update/delete, stopped only by RLS-with-no-policy. The rest
+-- of this file uses the broad form for exactly that reason.
+revoke all on public.participants from anon;
 
 
 -- ---------------------------------------------------------------------------
@@ -1077,8 +1081,16 @@ revoke select on public.participants from anon;
 -- is why Supabase labels it "Unrestricted".
 --
 -- Below: the leaderboard view is public (anon), because the ranking is a
--- public page. latest_balances and daily_balances are not - they expose
--- per-venue and per-day equity, which the ranking does not need.
+-- public page. daily_balances is not - it carries every participant's full
+-- per-day equity curve, which the ranking does not need and which nothing
+-- outside score.py reads.
+--
+-- latest_balances is revoked from anon too, but be clear that this protects
+-- nothing on its own: leaderboard selects spot_usdc, perp_usdc, total_usdc
+-- and as_of from it, which is every column it has that is not already on
+-- participants - so the public view is a strict SUPERSET of this one and
+-- anon can reconstruct it exactly. The revoke is tidiness, not a boundary.
+-- The boundary that matters is the one below it.
 -- ---------------------------------------------------------------------------
 
 revoke all on public.latest_balances from anon;

@@ -74,13 +74,18 @@ function normalise(raw: Record<string, unknown>): LeaderboardRow {
 /**
  * Read the board, degrading to sample data rather than to an error page.
  *
- * Two failures are expected during setup and both are reported in the UI
- * rather than thrown:
+ * Missing env vars are expected during setup: a Vercel project with no
+ * Supabase credentials yet renders the sample board and says so.
  *
- *   - env vars unset, i.e. the Vercel project has no Supabase credentials yet;
- *   - a permission error, because schema.sql ends with
- *     `revoke all on public.leaderboard from anon`. Until someone grants
- *     select to anon (or we add auth) the anon key legitimately sees nothing.
+ * A PERMISSION error is not expected and never was a setup state. schema.sql
+ * grants select on this view to anon, so a permission error means the grant
+ * has been lost - by a re-run of an older schema, or a revoke - and the board
+ * is serving MOCK_ROWS to the public under a banner. That is the only symptom
+ * of a regression tests/test_schema_grants.py exists to prevent, so the
+ * notice names it as something to fix rather than something to wait out.
+ *
+ * Both degrade to sample data rather than an error page, and both are
+ * reported in the UI rather than thrown.
  */
 export async function getLeaderboard(): Promise<LeaderboardResult> {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -111,7 +116,8 @@ export async function getLeaderboard(): Promise<LeaderboardResult> {
       source: "mock",
       notice:
         `Supabase returned an error, so this is sample data: ${error.message}. ` +
-        "If it mentions permission, the leaderboard view is still revoked from anon.",
+        "If it mentions permission, the anon grant on the leaderboard view is " +
+        "missing - run migrations/002_public_leaderboard_and_participant_privacy.sql.",
     };
   }
 

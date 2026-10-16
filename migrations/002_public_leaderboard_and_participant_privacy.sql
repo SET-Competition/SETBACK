@@ -41,21 +41,37 @@ drop policy if exists "leaderboard is readable" on public.participants;
 
 -- Belt and braces: RLS with no policy already returns zero rows, but the
 -- table grant is what made the policy reachable, so remove that too.
-revoke select on public.participants from anon;
+revoke all on public.participants from anon;
 
 commit;
 
 -- Confirmation: the SQL editor shows the last statement's result.
---   leaderboard_public        should be 1
---   participants_anon_select  should be 0
---   participants_anon_policy  should be 0
+--
+--   leaderboard_public        t   anon can read the board
+--   participants_readable     f   anon cannot read emails
+--   participants_policies     0   no policy left to re-open it
+--   views_owned_by            one row per object, all the same owner
+--
+-- has_table_privilege rather than information_schema.role_table_grants:
+-- that view only returns rows whose grantor or grantee is a currently
+-- enabled role, so a pre-existing Supabase default grant can read as absent
+-- BEFORE the revoke has run - a confirmation that says "already fine" when
+-- nothing has happened yet is worse than none. has_table_privilege answers
+-- the real question and cannot be filtered out.
+--
+-- views_owned_by is here because the fix above rests on views running with
+-- their OWNER's privileges, bypassing RLS. That holds when the views and
+-- participants share an owner, which they do when schema.sql created them
+-- all. If participants were owned by a different role, leaderboard would
+-- return zero rows instead of the board - an empty live table rather than a
+-- permission error, so the site would show an empty board, not sample data.
+-- Check the owners match; they should all read the same.
 select
-  (select count(*) from information_schema.role_table_grants
-    where table_schema = 'public' and table_name = 'leaderboard'
-      and grantee = 'anon' and privilege_type = 'SELECT')   as leaderboard_public,
-  (select count(*) from information_schema.role_table_grants
-    where table_schema = 'public' and table_name = 'participants'
-      and grantee = 'anon' and privilege_type = 'SELECT')   as participants_anon_select,
+  has_table_privilege('anon', 'public.leaderboard',   'select') as leaderboard_public,
+  has_table_privilege('anon', 'public.participants',  'select') as participants_readable,
   (select count(*) from pg_policies
-    where schemaname = 'public' and tablename = 'participants'
-      and policyname = 'leaderboard is readable')           as participants_anon_policy;
+    where schemaname = 'public' and tablename = 'participants')  as participants_policies,
+  (select string_agg(relname || '=' || relowner::regrole::text, ', ' order by relname)
+     from pg_class
+    where relname in ('participants', 'leaderboard', 'latest_balances'))
+                                                                 as views_owned_by;
