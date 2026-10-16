@@ -8,7 +8,16 @@ export const metadata: Metadata = {
     "Crypto trading competition ranked on a flow-adjusted Sharpe ratio.",
 };
 
-// The sync runs hourly, so anything fresher than this is wasted work.
+// The board only changes when the sync runs, and the sync is a Railway cron
+// service - three-hourly at the time of writing - so its cadence is not
+// something this repo can state and keep true. An earlier version of this
+// comment said "hourly" and was wrong within a week.
+//
+// Five minutes is well inside any plausible schedule. It is not chosen to
+// match the cron: it bounds how long a MANUAL run, or a change to the
+// schedule, stays invisible on the board, which is the case that actually
+// matters. Between syncs it costs a query against a view with one row per
+// participant.
 export const revalidate = 300;
 
 /**

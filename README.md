@@ -108,7 +108,7 @@ entries sort below established ones rather than disappearing.
 ## Commands
 
 ```bash
-uv run python post_to_supabase.py     # the hourly job: sync, then score
+uv run python post_to_supabase.py     # the scheduled job: sync, then score
 uv run python score.py                # rescore from stored history, no fetching
 uv run python score.py --period daily
 uv run python sign_ups.py             # drain pending signups from the form
