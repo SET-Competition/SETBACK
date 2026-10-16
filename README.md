@@ -131,15 +131,20 @@ data.
 ## Participant signup
 
 Participants submit at **`/register`** in the frontend ([`web/`](web/)), which
-POSTs to `pending_signups`. The importer verifies each key against the
-exchange, encrypts it under `FERNET_KEY`, and wipes the plaintext.
+POSTs to the `register` Edge Function. The importer then verifies each key
+against the exchange, encrypts it under `FERNET_KEY`, and wipes the plaintext.
 
 ```
-/register  →  pending_signups   anon may INSERT, and nothing else
-      →  sign_ups.py            verify read-only against the exchange
-                                → Fernet-encrypt → participant_api_keys
-                                → wipe the plaintext row
+/register  →  register (Edge Function)   rate-limit, validate, service role
+      →  pending_signups                 anon can reach NOTHING here
+      →  sign_ups.py                     verify read-only against the exchange
+                                         → Fernet-encrypt → participant_api_keys
+                                         → wipe the plaintext row
 ```
+
+The function is the entrance because the browser used to write to the table
+directly, which is why nothing could rate-limit the form — see **Rate
+limiting** below.
 
 **One submission registers every venue.** The page asks for Coinbase spot,
 Coinbase perpetuals and Lighter together, and POSTs an array of one to three
@@ -160,14 +165,32 @@ is resolved automatically at verification, so participants never supply it.
 
 **Setting it up**
 
-1. Set `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` on the
+1. Run [`migrations/schema.sql`](migrations/schema.sql) against the project.
+   It is idempotent and includes everything below; the numbered migrations
+   exist for databases that predate a change.
+2. Deploy the signup endpoint — **nothing can register until this exists**:
+
+   ```bash
+   supabase link --project-ref <your-project-ref>
+   supabase functions deploy register
+   ```
+
+   Confirm **Verify JWT is off** for it. If submissions come back
+   `503 Registration is temporarily unavailable` and the function log says
+   `rate limiter failed 404`, PostgREST has not reloaded its schema cache —
+   run `notify pgrst, 'reload schema';`.
+3. Set `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` on the
    frontend — `web/.env.local` locally, the Vercel project's Variables tab in
-   production. Neither is secret: the anon key is public by design, and RLS is
-   what constrains it. Without them `/register` renders but refuses to submit
-   and says so.
-2. Deploy over **HTTPS**. The page disables itself outside a secure context,
+   production. Neither is secret: the anon key is public by design, and the
+   grants are what constrain it. Without them `/register` renders but refuses
+   to submit and says so.
+4. Deploy over **HTTPS**. The page disables itself outside a secure context,
    because it asks people to type exchange credentials.
-3. Run `uv run python sign_ups.py` to drain the inbox.
+5. Run `uv run python sign_ups.py` to drain the inbox.
+
+On an existing database instead of step 1: run `migrations/003`, deploy the
+function, redeploy the site, then `migrations/004` — in that order. Between
+the redeploy and 004 both paths work, so the form is never down.
 
 The validation that runs before a credential leaves the browser lives in
 [`web/lib/signup.js`](web/lib/signup.js), and `tests/test_signup_form.py`
@@ -209,12 +232,28 @@ Verified against real PostgreSQL, along with a check constraint that refuses
 to let a resolved row keep a credential — so the plaintext is destroyed on
 import even if the importer has a bug.
 
-**Rate limiting.** Five submissions per IP per hour, counted and recorded in
-one statement by `record_signup_attempt` so two simultaneous requests cannot
-both pass a limit of one. Blocked attempts are deliberately NOT recorded — a
-flood that extended its own window would turn a rate limit into a permanent
-ban for everyone behind a NAT, a campus or a phone network. Tune with
-`SIGNUP_MAX_ATTEMPTS` and `SIGNUP_WINDOW` on the function, no redeploy needed.
+**Rate limiting.** 20 submissions per network per hour by default, counted and
+recorded in one statement by `record_signup_attempt` so two simultaneous
+requests cannot both pass a limit of one.
+
+Per **network**, not per address: `inet` equality compares the netmask too, so
+counting raw addresses would give any IPv6 client a fresh window per request
+(a residential allocation is a /64) and let anyone buy 33 windows on one IPv4
+address by varying the mask. Keys are normalised to /64 and /32.
+
+Blocked attempts are deliberately **not** recorded — a flood that extended its
+own window would turn a rate limit into a permanent ban for everyone behind a
+NAT, a campus or a phone network. That cuts both ways: 20/hour is shared by
+everyone behind a single CGNAT or campus egress, so **raise it before a launch
+event** where a cohort may sign up from one address.
+
+Tune with these, set as function secrets
+(`supabase secrets set SIGNUP_MAX_ATTEMPTS=50`), no redeploy needed:
+
+| variable | default | notes |
+|---|---|---|
+| `SIGNUP_MAX_ATTEMPTS` | `20` | A non-integer or non-positive value logs and falls back rather than disabling the limit |
+| `SIGNUP_WINDOW_SECONDS` | `3600` | Seconds, not an interval string — a malformed interval would 503 every request, and a negative one would move the window into the future and silently switch the limit off |
 
 A determined attacker with addresses to spend still gets through; this bounds
 casual abuse of an open form, which is what it is for. A captcha is the next

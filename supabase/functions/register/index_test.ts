@@ -16,7 +16,7 @@ import { assertEquals, assertStringIncludes } from "@std/assert";
 Deno.env.set("SUPABASE_URL", "https://example.supabase.co");
 Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "service-role-for-tests");
 
-const { clean, handle } = await import("./index.ts");
+const { clean, handle, isAddress, positiveInt } = await import("./index.ts");
 
 const VALID = {
   display_name: "tester",
@@ -56,7 +56,9 @@ function stubFetch(options: { allowed?: boolean; insertOk?: boolean } = {}) {
 
 function post(body: unknown, ip: string | null = "198.51.100.7"): Request {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (ip) headers["x-forwarded-for"] = `${ip}, 10.0.0.1`;
+  // The platform APPENDS the peer it saw, so the real address is LAST. The
+  // first element is whatever a caller chose to send.
+  if (ip) headers["x-forwarded-for"] = `203.0.113.99, ${ip}`;
   return new Request("https://example.supabase.co/functions/v1/register", {
     method: "POST",
     headers,
@@ -196,4 +198,178 @@ Deno.test("clean trims and normalises", () => {
   // An empty secret is null, not "" - Lighter has no secret and the column
   // is nullable precisely for that.
   assertEquals((row as Record<string, unknown>).api_secret, null);
+});
+
+Deno.test("the preflight allows every header the form actually sends", async () => {
+  // register-form.tsx sends apikey, Authorization and Content-Type. None of
+  // the first two is safelisted, so a reply that omits them makes the browser
+  // block the POST before it leaves - while curl, which ignores CORS, keeps
+  // working. That combination looks like a network fault to the participant
+  // and like a healthy endpoint to whoever is testing, so it is pinned here.
+  const response = await handle(
+    new Request("https://example.supabase.co/functions/v1/register", {
+      method: "OPTIONS",
+      headers: { "Access-Control-Request-Headers": "apikey,authorization,content-type" },
+    }),
+  );
+  assertEquals(response.status, 204);
+
+  const allowed = (response.headers.get("Access-Control-Allow-Headers") ?? "")
+    .toLowerCase();
+  for (const header of ["authorization", "apikey", "content-type"]) {
+    assertStringIncludes(allowed, header);
+  }
+});
+
+Deno.test("the trusted address is the LAST forwarded element, not the first", async () => {
+  const calls = stubFetch();
+  await handle(new Request("https://example.supabase.co/functions/v1/register", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      // A caller claiming to be someone else. Reading [0] would let five
+      // requests exhaust the victim's window - the permanent ban for a shared
+      // address that 003 avoids by not recording blocked attempts.
+      "x-forwarded-for": "198.51.100.50, 203.0.113.7",
+    },
+    body: JSON.stringify([VALID]),
+  }));
+  assertEquals((calls[0].body as Record<string, unknown>).p_ip, "203.0.113.7");
+});
+
+Deno.test("cf-connecting-ip wins, because the caller cannot set it", async () => {
+  const calls = stubFetch();
+  await handle(new Request("https://example.supabase.co/functions/v1/register", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "cf-connecting-ip": "192.0.2.10",
+      "x-forwarded-for": "198.51.100.50, 203.0.113.7",
+    },
+    body: JSON.stringify([VALID]),
+  }));
+  assertEquals((calls[0].body as Record<string, unknown>).p_ip, "192.0.2.10");
+});
+
+Deno.test("isAddress refuses anything that would widen the rate-limit key", () => {
+  for (const good of ["1.2.3.4", "255.255.255.255", "::1", "2001:db8::1"]) {
+    assertEquals(isAddress(good), true, `${good} should be accepted`);
+  }
+  for (const bad of [
+    "1.2.3.4/24",      // a mask makes a different inet - 33 free windows
+    "::/0",
+    "1.2.3.4:5678",    // port
+    "[::1]:443",
+    "fe80::1%eth0",    // zone id
+    "1:2",             // one colon is a port, not an address
+    "unknown",         // RFC-permitted XFF token
+    "999.1.1.1",
+    "",
+    "not an address",
+  ]) {
+    assertEquals(isAddress(bad), false, `${bad} should be refused`);
+  }
+});
+
+Deno.test("a forwarded chain of only junk is refused, not passed through", async () => {
+  const calls = stubFetch();
+  const response = await handle(new Request("https://example.supabase.co/functions/v1/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-forwarded-for": "unknown, garbage" },
+    body: JSON.stringify([VALID]),
+  }));
+  // 400, not 503: this is something about the request. Passing it on would
+  // make Postgres reject the inet and report an outage to a caller who simply
+  // sits behind a proxy that writes a non-address token.
+  assertEquals(response.status, 400);
+  assertEquals(calls.length, 0);
+});
+
+Deno.test("a mask cannot be smuggled through the forwarded header", async () => {
+  const calls = stubFetch();
+  const response = await handle(new Request("https://example.supabase.co/functions/v1/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-forwarded-for": "1.2.3.4/24" },
+    body: JSON.stringify([VALID]),
+  }));
+  assertEquals(response.status, 400);
+  assertEquals(calls.length, 0);
+});
+
+Deno.test("misconfiguration falls back to a working limit, never to none", () => {
+  // `Number(env ?? 5)` would give NaN here, JSON.stringify writes NaN as null,
+  // PostgREST passes null as SQL NULL, `recent >= NULL` is NULL - and the
+  // limit is silently off. The mirror case, "", becomes 0 and blocks everyone.
+  for (const hostile of ["abc", "", "   ", "-1", "0", "1.5", "NaN", "Infinity"]) {
+    Deno.env.set("SIGNUP_PROBE", hostile);
+    const value = positiveInt("SIGNUP_PROBE", 20);
+    assertEquals(value, 20, `${JSON.stringify(hostile)} should fall back`);
+    assertEquals(Number.isInteger(value), true);
+  }
+  Deno.env.set("SIGNUP_PROBE", "50");
+  assertEquals(positiveInt("SIGNUP_PROBE", 20), 50);
+  Deno.env.delete("SIGNUP_PROBE");
+  assertEquals(positiveInt("SIGNUP_PROBE", 20), 20);
+});
+
+Deno.test("the limiter is asked with integers, never null", async () => {
+  const calls = stubFetch();
+  await handle(post([VALID]));
+  const sent = calls[0].body as Record<string, unknown>;
+  assertEquals(Number.isInteger(sent.p_max_attempts), true);
+  assertEquals(Number.isInteger(sent.p_window_seconds), true);
+});
+
+Deno.test("an unexpected limiter body is an outage, not a rate limit", async () => {
+  // `!== true` would collapse these into a 429 - a permanent, convincing
+  // "too many submissions" wall that nobody would think to debug.
+  for (const body of ["[true]", '{"record_signup_attempt":true}', "null", '"yes"']) {
+    globalThis.fetch = (() =>
+      Promise.resolve(new Response(body, { status: 200 }))) as typeof fetch;
+    const response = await handle(post([VALID]));
+    assertEquals(response.status, 503, `${body} should read as an outage`);
+    await response.body?.cancel();
+  }
+});
+
+Deno.test("control characters are refused before they can reach the table", async () => {
+  // A NUL survives trim() and every length check, and text cannot store it -
+  // so the insert fails and the error path handles a PostgREST body carrying
+  // the credential. Refusing it here keeps that path unreachable.
+  const calls = stubFetch();
+  const response = await handle(post([{ ...VALID, display_name: "a\u0000b" }]));
+  assertEquals(response.status, 400);
+  assertEquals(calls.length, 0);
+  await response.body?.cancel();
+});
+
+Deno.test("a credential never reaches the log either", async () => {
+  const written: string[] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => void written.push(args.map(String).join(" "));
+  try {
+    stubFetch({ insertOk: false });
+    const response = await handle(post([VALID]));
+    await response.body?.cancel();
+  } finally {
+    console.error = realError;
+  }
+  const log = written.join("\n");
+  assertEquals(log.includes(VALID.api_key), false, "api_key must not be logged");
+  assertEquals(log.includes("Failing row contains"), false, "DETAIL must not be logged");
+  // Still useful: the operator gets the status and PostgreSQL's code.
+  assertStringIncludes(log, "insert failed 400");
+});
+
+Deno.test("identities cannot be made to collide through a separator", async () => {
+  // Keyed with JSON rather than a separator character: any separator can
+  // appear inside a submitted string and make two identities read as one.
+  const calls = stubFetch();
+  const response = await handle(post([
+    { ...VALID, display_name: "a", email: "b@c" },
+    { ...VALID, exchange: "coinbase", account_type: "spot", display_name: "a", email: "b@c.d" },
+  ]));
+  assertEquals(response.status, 400);
+  assertEquals(calls.length, 0);
+  await response.body?.cancel();
 });

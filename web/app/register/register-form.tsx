@@ -227,10 +227,14 @@ export default function RegisterForm() {
 
         setStatus({
           kind: "error",
+          // On 429 the function's own sentence already says everything,
+          // so `detail` is used INSTEAD of a local message rather than as
+          // well as one - an earlier version concatenated both and printed
+          // the same instruction three times in a row.
           message:
             response.status === 429
-              ? `Too many submissions from your network.${detail} ` +
-                "Wait an hour and try again, or contact the organiser."
+              ? (detail.trim() ||
+                "Too many submissions from your network. Please try again later.")
               : `Could not submit — the server rejected the request ` +
                 `(HTTP ${response.status}).${detail} Check your entries and ` +
                 `try again, or contact the organiser with that code.`,

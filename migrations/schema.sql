@@ -747,14 +747,21 @@ alter table public.pending_signups add column if not exists processed_at timesta
 alter table public.pending_signups drop column if exists ciphertext;
 alter table public.pending_signups drop column if exists api_passphrase;
 
--- anon can INSERT into this table, which makes every constraint below a limit
--- on what an anonymous caller can store. The size bounds are the point:
--- without them one request could park an arbitrary amount of data here.
+-- These constraints bound what one submission can store. The size bounds are
+-- the point: without them a single request could park an arbitrary amount of
+-- data here.
 --
--- They are not a defence against VOLUME. Nothing in Postgres stops the same
--- caller submitting repeatedly - that belongs at the edge, in Supabase rate
--- limiting or a captcha in front of the form, and is worth adding before the
--- form is advertised anywhere public.
+-- They are not a defence against VOLUME, and nothing in Postgres is - a
+-- constraint sees one row at a time. That used to be an open TODO here,
+-- saying volume "belongs at the edge, in Supabase rate limiting or a captcha".
+-- It turned out not to: anon inserted into this table DIRECTLY from the
+-- browser, so no edge in front of the website was ever on the path. Section
+-- 8a is where volume is handled now, and section 11 is what makes it the only
+-- way in.
+--
+-- The function still re-checks every bound below rather than trusting them to
+-- be hit. A constraint violation here comes back from PostgREST carrying
+-- `Failing row contains (...)`, api_key included.
 alter table public.pending_signups drop constraint if exists pending_signups_status_check;
 alter table public.pending_signups add constraint pending_signups_status_check
   check (status in ('pending', 'imported', 'rejected'));
@@ -789,6 +796,119 @@ alter table public.pending_signups add constraint pending_signups_resolved_is_em
     status = 'pending'
     or (api_key is null and api_secret is null)
   );
+
+
+-- ---------------------------------------------------------------------------
+-- 8a. Signup rate limiting
+--
+-- Submissions do not arrive from a browser any more. They arrive from the
+-- `register` Edge Function (supabase/functions/register/index.ts), which runs
+-- inside this project with the service role, identifies the caller, and calls
+-- record_signup_attempt before inserting.
+--
+-- That indirection exists because there was nowhere else to put a limit. The
+-- form POSTed from the browser straight to PostgREST, so the write never
+-- touched the website - and Cloudflare and Vercel both sit in front of the
+-- website. A rule there would have throttled page loads while the flood went
+-- to supabase.co directly, using the anon key every visitor downloads.
+--
+-- Section 11 revokes anon's insert, which is what makes this a limit rather
+-- than a speed bump beside an open door.
+-- ---------------------------------------------------------------------------
+
+-- One row per allowed submission. client_ip holds a NETWORK, not the exact
+-- address presented - see the function below. Personal data, kept on the
+-- narrow basis of preventing abuse of an open form, pruned after a day.
+-- Service-role only: no grant, and RLS with no policy.
+create table if not exists public.signup_attempts (
+  id           bigint generated always as identity primary key,
+  client_ip    inet        not null,
+  attempted_at timestamptz not null default now()
+);
+
+-- For the count: the window is scanned within one network.
+create index if not exists signup_attempts_ip_time
+  on public.signup_attempts (client_ip, attempted_at desc);
+
+-- For the prune. Without it that delete is a sequential scan on every
+-- request, so each submission costs more as the table grows - exactly
+-- backwards for something whose job is to survive a flood.
+create index if not exists signup_attempts_age
+  on public.signup_attempts (attempted_at);
+
+-- Count and record in ONE statement.
+--
+-- Counting and then inserting from the function would race: two requests that
+-- both read "4 so far" would both insert, and the limit would be one higher
+-- than it says under exactly the load it exists to handle.
+create or replace function public.record_signup_attempt(
+  p_ip             inet,
+  p_max_attempts   integer default 20,
+  p_window_seconds integer default 3600
+) returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $fn$
+declare
+  v_key    inet;
+  v_window interval;
+  recent   integer;
+begin
+  -- A null argument must not read as "no limit". The caller passes these from
+  -- its environment, and a misconfigured value arrives as JSON null rather
+  -- than as an absent argument, so the DEFAULT above does not apply.
+  -- `recent >= null` is null, the branch is not taken, and the limiter
+  -- silently stops limiting. Fail closed instead.
+  if p_ip is null or p_max_attempts is null or p_window_seconds is null then
+    return false;
+  end if;
+
+  -- Count per NETWORK, not per address. inet equality compares the address
+  -- AND the netmask, so without this an IPv6 client gets a fresh window per
+  -- source address - free, no forging, since a residential allocation is a
+  -- /64 and every device rotates through many /128s inside it - and
+  -- `1.2.3.4/24` is a different inet from `1.2.3.4/32`, so varying the mask
+  -- alone buys 33 windows on one IPv4 address.
+  v_key := network(set_masklen(p_ip, case when family(p_ip) = 6 then 64 else 32 end));
+  v_window := make_interval(secs => p_window_seconds);
+
+  -- Retention, not correctness. Run on roughly one call in fifty rather than
+  -- every one, because a delete on every request serialises concurrent
+  -- callers on the row locks of the same old rows - turning a limiter into a
+  -- queue under the load it exists for.
+  if random() < 0.02 then
+    delete from public.signup_attempts
+     where attempted_at < now() - interval '1 day';
+  end if;
+
+  select count(*) into recent
+    from public.signup_attempts
+   where client_ip = v_key
+     and attempted_at > now() - v_window;
+
+  if recent >= p_max_attempts then
+    -- Deliberately NOT recorded. Recording blocked attempts would let a flood
+    -- hold its own window open indefinitely, turning a rate limit into a
+    -- permanent ban for whoever shares that network.
+    return false;
+  end if;
+
+  insert into public.signup_attempts (client_ip) values (v_key);
+  return true;
+end;
+$fn$;
+
+-- security definer runs as the owner, so EXECUTE comes away from PUBLIC...
+revoke all on function public.record_signup_attempt(inet, integer, integer) from public;
+revoke all on function public.record_signup_attempt(inet, integer, integer) from anon;
+revoke all on function public.record_signup_attempt(inet, integer, integer) from authenticated;
+
+-- ...and goes back, explicitly, to the one role that calls it. Supabase's
+-- default privileges would usually cover this, but the entire signup flow
+-- gates on this call and "it works because of a platform default" is not
+-- something to leave implicit.
+grant execute on function public.record_signup_attempt(inet, integer, integer) to service_role;
 
 
 -- ---------------------------------------------------------------------------

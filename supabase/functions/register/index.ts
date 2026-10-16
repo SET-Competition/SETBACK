@@ -9,13 +9,13 @@
  *
  * This function is the replacement entrance. It runs inside the Supabase
  * project with the service role, which never leaves the platform: not in a
- * Vercel variable, not in the bundle, not in this repository. It sees the
- * caller's address, asks the database whether that address has submitted too
- * often, and inserts only if the answer is yes.
+ * Vercel variable, not in the bundle, not in this repository. It identifies
+ * the caller, asks the database whether that caller has submitted too often,
+ * and inserts only if the answer is yes.
  *
- * migrations/004 then revokes anon's insert. Until that is run, the old path
- * is still open and this is a door beside an doorway - deploy this first,
- * point the site at it, and only then run 004.
+ * migrations/004 then revokes anon's insert. Deploy this and point the site
+ * at it BEFORE running 004 - until then the old path is still open and this
+ * is a door beside an open doorway.
  *
  * NO DEPENDENCIES ON PURPOSE. This is the one piece of the system that
  * handles plaintext exchange credentials in transit, and PostgREST is a REST
@@ -28,28 +28,68 @@
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-/** Submissions allowed per address per window, overridable without a redeploy. */
-const MAX_ATTEMPTS = Number(Deno.env.get("SIGNUP_MAX_ATTEMPTS") ?? 5);
-const WINDOW = Deno.env.get("SIGNUP_WINDOW") ?? "01:00:00";
+/**
+ * Config is validated, not merely defaulted.
+ *
+ * `Number(Deno.env.get(x) ?? 5)` looks equivalent and is not: `??` catches
+ * only UNSET, so a typo'd value becomes NaN, JSON.stringify writes NaN as
+ * null, PostgREST passes an explicit null as SQL NULL, and `recent >= NULL`
+ * is NULL - so the branch is not taken and THE LIMIT IS SILENTLY OFF. The
+ * mirror case is as bad: "" becomes 0, and 0 >= 0 blocks everyone forever.
+ * A misconfigured limiter must fall back to a working one and say so.
+ */
+export function positiveInt(name: string, fallback: number): number {
+  const raw = Deno.env.get(name);
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    console.error(`${name}=${JSON.stringify(raw)} is not a positive integer; using ${fallback}`);
+    return fallback;
+  }
+  return value;
+}
+
+/** Submissions allowed per caller per window. Tunable without a redeploy. */
+const MAX_ATTEMPTS = positiveInt("SIGNUP_MAX_ATTEMPTS", 20);
+/**
+ * Seconds, not an interval string.
+ *
+ * An interval taken from the environment is a string Postgres parses, and the
+ * failure modes are invisible: malformed means every request 503s, and
+ * `-1 hour` moves the window into the future so the count is always zero and
+ * the limit is off with nothing to see.
+ */
+const WINDOW_SECONDS = positiveInt("SIGNUP_WINDOW_SECONDS", 3600);
 
 /** A submission covers at most the three venues the form offers. */
 const MAX_ROWS = 3;
 /** Bounded before parsing: 4000-char secrets, three of them, plus slack. */
 const MAX_BODY_BYTES = 32_768;
 
+/**
+ * Must stay in step with VENUES in web/lib/signup.js.
+ * tests/test_signup_form.py asserts they agree.
+ */
 const VENUES = new Set(["coinbase:spot", "coinbase:perp", "lighter:perp"]);
 
 /**
- * CORS is `*` deliberately.
+ * CORS must name every header the form sends, or no browser ever gets here.
  *
- * It is not a control here and pretending otherwise would be worse than
- * leaving it open: this endpoint is public by necessity, and CORS governs
- * what a BROWSER will hand to a script on another origin, not what a script
- * anywhere can send. curl ignores it. The rate limit is the control.
+ * `register-form.tsx` sends apikey and Authorization alongside Content-Type.
+ * Those are not safelisted, so the browser preflights, and a reply that omits
+ * them blocks the POST before it is sent - while curl, which ignores CORS
+ * entirely, keeps working. That combination makes it look like a network
+ * fault to the participant and like a healthy endpoint to whoever is testing.
+ * `*` would not help: it is not honoured for Authorization.
+ *
+ * The origin is `*` deliberately. It is not a control here and pretending
+ * otherwise would be worse than leaving it open: this endpoint is public by
+ * necessity, and CORS governs what a BROWSER hands to a script on another
+ * origin, not what a script anywhere can send. The rate limit is the control.
  */
 const CORS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "content-type",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Max-Age": "86400",
 };
@@ -59,6 +99,49 @@ function reply(status: number, body: Record<string, unknown> = {}): Response {
     status,
     headers: { ...CORS, "Content-Type": "application/json" },
   });
+}
+
+/** A bare address: no netmask, no port, no brackets, no zone. */
+export function isAddress(value: string): boolean {
+  // A netmask would widen the rate-limit key - `1.2.3.4/24` is a different
+  // inet from `1.2.3.4/32`, so varying it buys 33 independent windows.
+  if (value.includes("/") || value.includes("%") || value.includes("[")) return false;
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(value)) {
+    return value.split(".").every((octet) => Number(octet) <= 255);
+  }
+  // At least TWO colons. One colon and dots is `1.2.3.4:5678` - an address
+  // with a port, which would otherwise pass this branch and then be rejected
+  // by Postgres, turning a caller behind a port-appending proxy into a 503.
+  // Real IPv6 always has two or more, IPv4-mapped forms included.
+  const colons = value.length - value.replaceAll(":", "").length;
+  return colons >= 2 && value.length <= 45 && /^[0-9a-f:.]+$/i.test(value);
+}
+
+/**
+ * Who is calling, as far as anything here can tell.
+ *
+ * cf-connecting-ip is written by the platform edge and cannot be set by the
+ * caller, so it is preferred. Failing that, the LAST valid element of
+ * x-forwarded-for: the platform APPENDS the peer it saw, so the last entry is
+ * the one it wrote and the first is whatever the caller sent.
+ *
+ * An earlier version read `split(",")[0]` and argued that forging it "evades
+ * the limit without affecting anyone else". That was wrong twice over. Five
+ * requests carrying a victim's address exhaust that address's window, which
+ * is precisely the permanent ban for everyone behind a NAT that this design
+ * avoids elsewhere by not recording blocked attempts; and rotating the forged
+ * value gives unlimited rows in the table this exists to bound.
+ */
+export function clientAddress(headers: Headers): string | null {
+  const direct = (headers.get("cf-connecting-ip") ?? "").trim();
+  if (isAddress(direct)) return direct;
+
+  const chain = (headers.get("x-forwarded-for") ?? "").split(",");
+  for (let i = chain.length - 1; i >= 0; i--) {
+    const candidate = chain[i].trim();
+    if (isAddress(candidate)) return candidate;
+  }
+  return null;
 }
 
 /** The columns a submitter is allowed to set. Everything else is dropped. */
@@ -72,10 +155,22 @@ export function clean(raw: Record<string, unknown>): Record<string, string | nul
   const api_key = text(raw.api_key);
   const api_secret = text(raw.api_secret);
 
+  // Control characters are rejected here rather than left to Postgres.
+  //
+  // A NUL survives trim() and every length check below, and then text cannot
+  // store it - so the insert fails, and the failure is the one path in this
+  // function that handles a PostgREST error body containing the credential.
+  // Refusing it early keeps that path unreachable by submission.
+  for (const field of [display_name, email, exchange, account_type, api_key, api_secret]) {
+    // deno-lint-ignore no-control-regex
+    if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(field)) {
+      return "entries for unusual characters";
+    }
+  }
+
   // Bounds mirror pending_signups_size_check in migrations/schema.sql. They
   // are re-checked rather than trusted because the browser is not the only
-  // thing that can call this, and a constraint violation here would come back
-  // from PostgREST carrying the whole failing row - credentials included.
+  // thing that can call this.
   if (display_name.length < 1 || display_name.length > 40) return "display name";
   if (email.length < 3 || email.length > 320 || !email.includes("@")) return "email";
   if (!VENUES.has(`${exchange}:${account_type}`)) return "venue";
@@ -101,17 +196,39 @@ export function clean(raw: Record<string, unknown>): Record<string, string | nul
   };
 }
 
-async function postgrest(path: string, body: unknown, prefer: string): Promise<Response> {
+async function postgrest(path: string, body: unknown, prefer?: string): Promise<Response> {
+  const headers: Record<string, string> = {
+    apikey: SERVICE_ROLE,
+    Authorization: `Bearer ${SERVICE_ROLE}`,
+    "Content-Type": "application/json",
+  };
+  if (prefer) headers.Prefer = prefer;
   return await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
     method: "POST",
-    headers: {
-      apikey: SERVICE_ROLE,
-      Authorization: `Bearer ${SERVICE_ROLE}`,
-      "Content-Type": "application/json",
-      Prefer: prefer,
-    },
+    headers,
     body: JSON.stringify(body),
   });
+}
+
+/**
+ * What went wrong, without what it went wrong ON.
+ *
+ * PostgREST returns PostgreSQL's DETAIL, and for a constraint violation on
+ * this table that is `Failing row contains (...)` with api_key in it. Logging
+ * the body verbatim moves the plaintext from a row that gets wiped on import
+ * into a log with no wipe, no constraint, a wider audience and any configured
+ * drain. `code` and `message` are what an operator acts on; `details` and
+ * `hint` are what carry the credential.
+ */
+async function safeDetail(response: Response): Promise<string> {
+  try {
+    const body = await response.json();
+    const code = typeof body?.code === "string" ? body.code : "?";
+    const message = typeof body?.message === "string" ? body.message.slice(0, 200) : "?";
+    return `${code}: ${message}`;
+  } catch {
+    return "(unparseable body, withheld)";
+  }
 }
 
 export async function handle(request: Request): Promise<Response> {
@@ -122,7 +239,11 @@ export async function handle(request: Request): Promise<Response> {
   if (declared > MAX_BODY_BYTES) return reply(413, { error: "Submission too large" });
 
   const raw = await request.text();
-  if (raw.length > MAX_BODY_BYTES) return reply(413, { error: "Submission too large" });
+  // Bytes, not string length: `raw.length` counts UTF-16 code units, so a body
+  // of astral characters is more than twice the size this is meant to bound.
+  if (new TextEncoder().encode(raw).length > MAX_BODY_BYTES) {
+    return reply(413, { error: "Submission too large" });
+  }
 
   let parsed: unknown;
   try {
@@ -137,7 +258,7 @@ export async function handle(request: Request): Promise<Response> {
 
   const rows: Record<string, string | null>[] = [];
   for (const candidate of parsed) {
-    if (typeof candidate !== "object" || candidate === null) {
+    if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) {
       return reply(400, { error: "Malformed submission" });
     }
     const result = clean(candidate as Record<string, unknown>);
@@ -149,51 +270,58 @@ export async function handle(request: Request): Promise<Response> {
 
   // One submission is one participant. Rows disagreeing about who they belong
   // to would register several people from a single rate-limited request.
-  if (new Set(rows.map((r) => `${r.display_name}\u0000${r.email}`)).size > 1) {
+  // Keyed with JSON rather than a separator character, because any separator
+  // can appear in a submitted string and make two different identities read
+  // as one.
+  const identities = new Set(rows.map((r) => JSON.stringify([r.display_name, r.email])));
+  if (identities.size > 1) {
     return reply(400, { error: "Every venue must carry the same name and email" });
   }
   if (new Set(rows.map((r) => `${r.exchange}:${r.account_type}`)).size !== rows.length) {
     return reply(400, { error: "Each venue may be submitted once" });
   }
 
-  // x-forwarded-for is a list, client first. It is attacker-controlled, but
-  // the platform appends the real peer and the database only ever compares
-  // this value to itself - a forged address evades the limit without
-  // affecting anyone else's.
-  const forwarded = request.headers.get("x-forwarded-for") ?? "";
-  const ip = forwarded.split(",")[0].trim();
-  if (!ip) {
-    // Fail CLOSED. An unidentifiable caller is exactly the shape of the abuse
-    // this exists to stop, and signups are rare enough that refusing one is
-    // cheaper than leaving the limit bypassable by stripping a header.
+  const address = clientAddress(request.headers);
+  if (!address) {
+    // Fail CLOSED. An unidentifiable caller is the shape of the abuse this
+    // exists to stop, and refusing one legitimate submission is cheaper than
+    // a limit that is bypassed by deleting a header. 400 rather than 503:
+    // this is something about the request, and saying "temporarily
+    // unavailable" would send the operator looking for an outage.
     return reply(400, { error: "Could not identify the request origin" });
   }
 
   const gate = await postgrest("rpc/record_signup_attempt", {
-    p_ip: ip,
+    p_ip: address,
     p_max_attempts: MAX_ATTEMPTS,
-    p_window: WINDOW,
-  }, "return=representation");
+    p_window_seconds: WINDOW_SECONDS,
+  });
 
   if (!gate.ok) {
-    console.error("rate limiter failed", gate.status, await gate.text());
+    console.error("rate limiter failed", gate.status, await safeDetail(gate));
     return reply(503, { error: "Registration is temporarily unavailable" });
   }
-  if ((await gate.json()) !== true) {
+
+  // `=== false` rather than `!== true`, so an unexpected body is an OUTAGE
+  // and not a rate limit. PostgREST returns a bare `true` for a scalar
+  // function today; if that framing ever changes, `!== true` would turn the
+  // endpoint into a permanent, convincing-looking "too many submissions" wall
+  // that nobody would think to debug.
+  const allowed = await gate.json();
+  if (allowed === false) {
     return reply(429, {
-      error: "Too many submissions from this network. Try again in an hour.",
+      error: "Too many submissions from this network. Please try again later.",
     });
+  }
+  if (allowed !== true) {
+    console.error("rate limiter returned an unexpected body", JSON.stringify(allowed));
+    return reply(503, { error: "Registration is temporarily unavailable" });
   }
 
   const inserted = await postgrest("pending_signups", rows, "return=minimal");
 
   if (!inserted.ok) {
-    // The body is logged and never returned. PostgREST hands back
-    // PostgreSQL's DETAIL, and for a check-constraint violation that is
-    // `Failing row contains (...)` - the entire row, api_key included.
-    // Bounding how long that plaintext is visible is the property this whole
-    // design turns on, and it would be absurd to undo that here.
-    console.error("insert failed", inserted.status, await inserted.text());
+    console.error("insert failed", inserted.status, await safeDetail(inserted));
     return reply(502, { error: "Could not record the submission" });
   }
 

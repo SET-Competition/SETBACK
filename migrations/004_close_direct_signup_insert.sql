@@ -15,8 +15,26 @@
 -- only entrance - otherwise it is a speed bump beside an open door, and the
 -- door is the one documented in the bundle every visitor downloads.
 --
--- To undo, re-run the two statements from schema.sql section 11 that this
--- replaces (the "anon submits a signup" policy and `grant insert`).
+-- TO UNDO, two things are needed and the SQL alone is not enough.
+--
+-- The deployed site posts to /functions/v1/register, so re-opening the table
+-- without reverting the frontend leaves the form pointing at a function that
+-- may be the thing you are rolling back from. Revert
+-- web/app/register/register-form.tsx to post to /rest/v1/pending_signups and
+-- redeploy, THEN run:
+--
+--   create policy "anon submits a signup"
+--     on public.pending_signups
+--     for insert
+--     to anon
+--     with check (true);
+--
+--   grant insert on public.pending_signups to anon;
+--   revoke select, update, delete on public.pending_signups from anon;
+--
+-- Written out in full because this PR deleted them from schema.sql, and a
+-- rollback instruction that says "re-run the statements this replaces" is
+-- useless once the statements are only in git history.
 --
 -- Safe to run more than once.
 -- ---------------------------------------------------------------------------

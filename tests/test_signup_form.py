@@ -33,6 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FORM = REPO_ROOT / "web" / "lib" / "signup.js"
 REGISTER_PAGE = REPO_ROOT / "web" / "app" / "register" / "register-form.tsx"
 SCHEMA = REPO_ROOT / "migrations" / "schema.sql"
+EDGE_FUNCTION = REPO_ROOT / "supabase" / "functions" / "register" / "index.ts"
 
 PORTABLE = re.compile(
     r"// ===== BEGIN PORTABLE LOGIC.*?\n(.*?)// ===== END PORTABLE LOGIC", re.S)
@@ -379,3 +380,80 @@ def test_venue_values_satisfy_the_schema_constraints():
         f"form emits {sorted(exchanges - allowed_exchanges)}, which the schema rejects"
     assert account_types <= allowed_types, \
         f"form emits {sorted(account_types - allowed_types)}, which the schema rejects"
+
+
+def _form_venues() -> set[str]:
+    """The venues the form offers, as `exchange:account_type`."""
+    source = FORM.read_text(encoding="utf-8")
+    pairs = re.findall(
+        r'exchange:\s*"(?P<exchange>\w+)"\s*,\s*account_type:\s*"(?P<account>\w+)"',
+        source,
+    )
+    assert pairs, "no venues found in web/lib/signup.js"
+    return {f"{exchange}:{account}" for exchange, account in pairs}
+
+
+def test_the_edge_function_offers_the_same_venues_as_the_form():
+    """
+    The fourth artifact that has to agree, and the newest.
+
+    This file exists because the form, the table and the importer cannot be
+    checked against each other by any compiler. The register Edge Function is
+    now between the form and the table, written in a fourth language, and it
+    re-validates every field rather than trusting the browser - which means it
+    carries its own copy of the venue list.
+
+    Add a venue to the form and forget this one and the failure is the quiet
+    kind this file was written for: complete submissions come back
+    "Check your venue." from a function nobody is looking at, while the form,
+    the schema and the importer all agree with each other.
+    """
+    source = EDGE_FUNCTION.read_text(encoding="utf-8")
+
+    declared = re.search(r"const VENUES = new Set\(\[(?P<body>.*?)\]\)", source, re.DOTALL)
+    assert declared, "VENUES not found in the register function"
+    function_venues = set(re.findall(r'"([^"]+)"', declared.group("body")))
+
+    assert function_venues == _form_venues(), (
+        "The register Edge Function and web/lib/signup.js disagree about which "
+        "venues exist.\n"
+        f"  function: {sorted(function_venues)}\n"
+        f"  form:     {sorted(_form_venues())}\n"
+        "A venue the function does not know is rejected with "
+        '"Check your venue." after the form has already accepted it.'
+    )
+
+    # One submission carries one row per venue, so the cap has to be at least
+    # as large as the list - otherwise someone registering everything they
+    # trade is refused for submitting too much.
+    cap = re.search(r"const MAX_ROWS = (\d+)", source)
+    assert cap, "MAX_ROWS not found in the register function"
+    assert int(cap.group(1)) >= len(function_venues), (
+        f"MAX_ROWS is {cap.group(1)} but there are {len(function_venues)} venues, "
+        "so a participant who trades all of them cannot register."
+    )
+
+
+def test_the_form_posts_to_the_edge_function_and_not_to_the_table():
+    """
+    Where the form posts is the whole of the rate limit.
+
+    `test_the_form_reads_its_endpoint_from_the_environment` only checks that
+    the two NEXT_PUBLIC_ names are read, so it passes just as happily if the
+    page posts straight to /rest/v1/pending_signups - which is what it used to
+    do, and what nothing could rate-limit, because that write never touched
+    any server this project controls.
+
+    Reverting it would not look like a break. The form would keep working, and
+    the limit would quietly become optional for anyone who read the anon key
+    out of the bundle.
+    """
+    source = REGISTER_PAGE.read_text(encoding="utf-8")
+
+    assert "/functions/v1/register" in source, (
+        "The register page does not post to the register Edge Function."
+    )
+    assert "rest/v1/pending_signups" not in source, (
+        "The register page still posts directly to PostgREST, which bypasses "
+        "the rate limit in migrations/003 entirely."
+    )

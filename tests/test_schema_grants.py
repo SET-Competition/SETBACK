@@ -233,7 +233,8 @@ _DROP_POLICY = re.compile(
 
 def _surviving_policies(statements: list[str], table: str, command: str) -> list[str]:
     """
-    Policy names that let anon SELECT `table` once the file has finished.
+    Policy names that let anon run `command` on `table` once the file has
+    finished.
 
     The body is cut at `using` / `with check` before anything is read from it.
     Without that, the first `for` or `to` ANYWHERE won - including inside a
