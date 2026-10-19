@@ -85,13 +85,27 @@ Treat that banner as a bug, not as setup. `tests/test_schema_grants.py` exists
 to stop the grant being lost again, because the symptom is a public ranking
 full of invented traders rather than an error anyone would notice.
 
-## Deploying to set-global.com
+## Where this is deployed
+
+**https://app.set.trade** — Vercel, Root Directory `web/`.
+
+The subdomain is not a style choice. `set.trade` and `www.set.trade` serve a
+separate Framer site, so the apex is not available: pointing it here would take
+that site down. Framer keeps the apex, this keeps `app.`, and neither touches
+the other's DNS records.
+
+To stand up another environment:
 
 1. Import the repository into Vercel and set **Root Directory** to `web/`.
-2. Add both `NEXT_PUBLIC_*` variables in the project's Settings → Environment
-   Variables, for every environment you build.
-3. Settings → Domains, add `set-global.com`, and point the DNS records Vercel
-   gives you at it from wherever the domain is registered.
+2. Add both `NEXT_PUBLIC_*` variables under Settings → Environment Variables,
+   for every environment you build — they are inlined at build time, so a
+   variable added afterwards needs a redeploy, not a restart.
+3. Settings → Domains, add the hostname, and create the `CNAME` Vercel gives
+   you at your DNS provider.
+
+If that provider is Cloudflare, set the record to **DNS only (grey cloud)**.
+Proxying it stacks Cloudflare in front of Vercel's own CDN and interferes with
+certificate issuance.
 
 `/register` must be served over HTTPS, which Vercel does automatically. The page
 disables itself outside a secure context, because it asks people to type
