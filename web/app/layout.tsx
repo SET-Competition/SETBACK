@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import Link from "next/link";
+import { Wordmark } from "./brand";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -13,12 +14,39 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+const DESCRIPTION =
+  "Crypto trading competition ranked on a flow-adjusted Sharpe ratio.";
+
 // Each route sets its own title; this is the fallback and the site-wide
 // description.
+//
+// metadataBase is required for the social card to work. Without it Next
+// cannot turn the relative opengraph-image path into the absolute URL that
+// Slack, Discord and X all demand, and the card silently does not render -
+// there is no error, the link just comes out bare. It is read from the
+// environment so a preview deployment advertises its own images rather than
+// production's; VERCEL_URL is set by Vercel on every deployment and carries
+// no scheme, hence the template.
 export const metadata: Metadata = {
+  metadataBase: new URL(
+    process.env.NEXT_PUBLIC_SITE_URL ??
+      (process.env.VERCEL_URL
+        ? `https://${process.env.VERCEL_URL}`
+        : "https://app.set.trade"),
+  ),
   title: "SET",
-  description:
-    "Crypto trading competition ranked on a flow-adjusted Sharpe ratio.",
+  description: DESCRIPTION,
+  openGraph: {
+    title: "SET",
+    description: DESCRIPTION,
+    siteName: "SET",
+    type: "website",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "SET",
+    description: DESCRIPTION,
+  },
 };
 
 function Nav() {
@@ -27,9 +55,13 @@ function Nav() {
       <div className="mx-auto flex w-full max-w-5xl items-center gap-5 px-4 py-3.5 sm:px-6">
         <Link
           href="/leaderboard"
-          className="font-mono text-sm font-semibold tracking-widest text-white"
+          aria-label="SET - home"
+          className="text-white transition-opacity hover:opacity-70"
         >
-          SET
+          {/* Height-constrained, width auto: the lockup is 4.25:1, so sizing
+              it by width would leave it a different height on every
+              breakpoint and misalign it with the links beside it. */}
+          <Wordmark className="h-[18px] w-auto" />
         </Link>
         <div className="ml-auto flex items-center gap-4 text-sm">
           <Link href="/leaderboard" className="text-white/50 transition-colors hover:text-white">
