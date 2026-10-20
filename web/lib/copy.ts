@@ -26,5 +26,13 @@ export const DESCRIPTION =
  */
 export const TAGLINE = "Ranked on a flow-adjusted Sharpe ratio";
 
-/** What a screen reader hears in place of the social card. */
-export const CARD_ALT = `SET - ${TAGLINE.toLowerCase()}`;
+/**
+ * What a screen reader hears in place of the social card.
+ *
+ * TAGLINE is used as written. An earlier version lowercased it to make the
+ * join read as one sentence, which also lowercased Sharpe - a surname, and
+ * the one word in the phrase that carries the meaning. Alt text is read
+ * aloud; "flow-adjusted sharpe ratio" is the kind of thing that sounds like
+ * a typo to anyone who knows what it refers to.
+ */
+export const CARD_ALT = `SET - ${TAGLINE}`;
