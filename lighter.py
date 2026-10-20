@@ -206,6 +206,21 @@ def build_exchange_from_token(token: str, encrypted: bool = True,
 
     exchange = ccxt.lighter({'enableRateLimit': True, **options})
 
+    # Turn off ccxt's own Lighter fee. With builderFee on - ccxt's default -
+    # ccxt signs and submits an on-chain approval letting its integrator
+    # account (718718) charge a maker and taker fee, without asking, the first
+    # time it loads an account holding a wallet private key, and then attaches
+    # that fee to every order it places. The money goes to ccxt, on top of
+    # Lighter's own fee.
+    #
+    # Nothing here can trigger it today: the approval needs a wallet key to
+    # sign and this adapter accepts read-only tokens only, and nothing in the
+    # codebase places orders. It is off anyway, so that a future feature that
+    # trades, or a script reusing this builder, cannot start paying ccxt
+    # without anyone deciding to. Reads are unaffected - the option is only
+    # consulted when approving and when building an order.
+    exchange.options['builderFee'] = False
+
     # See venue_common: ccxt's limiter is per instance and the sync builds one
     # per credential, so the aggregate rate would otherwise scale with the
     # worker count. Lighter's ccxt default is a conservative 1 req/s, which

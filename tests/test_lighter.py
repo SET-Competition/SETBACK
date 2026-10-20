@@ -489,3 +489,76 @@ def test_cash_flows_alone_still_find_the_address():
 
     assert lighter._l1_address(exchange) == "0x" + "1" * 40
     assert exchange.balance_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# ccxt's own Lighter fee is off
+#
+# With builderFee on - ccxt's default - ccxt approves its integrator account
+# (718718) to charge a maker and taker fee the first time it loads an account
+# holding a wallet key, and attaches that fee to every order. Nothing here
+# trades or holds a wallet key, so nothing pays it today; it is switched off
+# so that nothing added later can start paying ccxt by default either.
+#
+# Asserted on BEHAVIOUR - the order ccxt would build, and whether it tries to
+# approve - not just on the option, so a ccxt release that renames the switch
+# fails here instead of leaving an override that no longer does anything.
+# ---------------------------------------------------------------------------
+
+# One real Lighter market, as ccxt parses it (public data, trimmed).
+ETH_PERP = {
+    "id": "0", "symbol": "ETH/USDC:USDC", "base": "ETH", "quote": "USDC",
+    "settle": "USDC", "baseId": "ETH", "quoteId": "USDC", "settleId": "USDC",
+    "type": "swap", "swap": True, "linear": True, "inverse": False,
+    "contract": True, "contractSize": 1.0, "spot": False, "margin": False,
+    "future": False, "option": False, "active": True,
+    "precision": {"amount": 0.0001, "price": 0.01},
+    "limits": {"amount": {"min": 0.002, "max": None},
+               "price": {"min": None, "max": None},
+               "cost": {"min": 10.0, "max": None},
+               "leverage": {"min": None, "max": None}},
+    "info": {"symbol": "ETH", "market_id": 0, "market_type": "perp",
+             "supported_size_decimals": 4, "supported_price_decimals": 2,
+             "size_decimals": 4, "price_decimals": 2},
+}
+
+
+def _fee_fields_on_an_order(exchange):
+    """The integrator fields ccxt would put on a limit order. Builds it, never sends it."""
+    exchange.set_markets([ETH_PERP])
+    request = exchange.create_order_request(
+        "ETH/USDC:USDC", "limit", "buy", 0.01, 2000.0,
+        {"nonce": 1, "apiKeyIndex": 2, "accountIndex": 741152})
+    return sorted(k for k in request[0] if k.startswith("integrator"))
+
+
+def test_ccxt_charges_its_fee_by_default():
+    """The control: proves the test can see the fee, so its absence below means something."""
+    assert _fee_fields_on_an_order(ccxt.lighter()) == [
+        "integrator_account_index", "integrator_maker_fee", "integrator_taker_fee"]
+
+
+def test_our_clients_put_no_ccxt_fee_on_an_order():
+    exchange = lighter.build_exchange_from_token(token(), encrypted=False)
+    assert _fee_fields_on_an_order(exchange) == []
+
+
+def test_a_stored_credential_gets_a_fee_free_client_too():
+    from venue_common import get_fernet
+    sealed = get_fernet().encrypt(token().encode()).decode()
+    exchange = lighter.build_exchange(sealed, encrypted=True)
+    assert _fee_fields_on_an_order(exchange) == []
+
+
+def test_our_clients_never_approve_ccxts_integrator(monkeypatch):
+    """
+    The other half of the fee: the automatic on-chain approval. With the
+    switch off ccxt must not even attempt it.
+    """
+    exchange = lighter.build_exchange_from_token(token(), encrypted=False)
+
+    def approval_attempted(*args, **kwargs):
+        raise AssertionError("ccxt tried to approve its integrator fee")
+
+    monkeypatch.setattr(exchange, "approve_builder_fee", approval_attempted)
+    assert exchange.handle_builder_fee_approval(741152, 2) is False
