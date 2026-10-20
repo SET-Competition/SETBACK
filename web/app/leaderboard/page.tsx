@@ -1,11 +1,11 @@
 import type { Metadata } from "next";
 
+import { DESCRIPTION } from "@/lib/copy";
 import { getLeaderboard, type LeaderboardRow } from "@/lib/leaderboard";
 
 export const metadata: Metadata = {
   title: "SET — Leaderboard",
-  description:
-    "Crypto trading competition ranked on a flow-adjusted Sharpe ratio.",
+  description: DESCRIPTION,
 };
 
 // The board only changes when the sync runs, and the sync is a Railway cron
