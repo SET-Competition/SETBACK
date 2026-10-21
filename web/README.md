@@ -30,6 +30,46 @@ LOGIC markers and runs it under Node against the repository's schema, so the
 venue list, the POSTed columns and `pending_signups` cannot drift apart. Its
 types are JSDoc, which TypeScript honours in a `.js` file.
 
+## The brand marks
+
+The SET lockup and logomark are geometry, held once in
+[`lib/marks.ts`](lib/marks.ts). Everything that draws them imports it:
+`app/brand.tsx` for the nav, `app/opengraph-image.tsx` for the share card.
+The words that go with them live in [`lib/copy.ts`](lib/copy.ts) for the same
+reason.
+
+Three files cannot import anything, because they are consumed as files:
+
+| File | What reads it |
+|---|---|
+| `app/icon.svg` | The browser tab, in anything modern. The source the other two are made from. |
+| `app/apple-icon.png` | iOS home screens. 180x180, **generated**. |
+| `app/favicon.ico` | Old browsers and some feed readers. 16+32, **generated**. |
+
+`icon.svg`'s paths are a copy of `LOGOMARK_PATHS` and are not edited by
+hand - `lib/marks.ts` is regenerated from the brand kit and the paths are
+carried across, which `tests/test_brand_assets.py` enforces. What *is* chosen
+by hand is the rest of the file: the square canvas, the background rect, and
+the translate/scale that set the padding.
+
+Change the logo and you regenerate `lib/marks.ts` from the brand kit, carry
+`LOGOMARK_PATHS` into `app/icon.svg`, then run:
+
+```bash
+npm run icons        # rasterises app/icon.svg into the other two
+```
+
+Commit what it writes. It is deliberately not part of `npm run build`: Vercel
+would otherwise regenerate two committed binaries on every deploy, against
+whatever libvips the builder ships, and a rendering change would reach
+production without ever appearing in a diff.
+
+`tests/test_brand_assets.py` holds these together — it checks that `icon.svg`
+draws `LOGOMARK_PATHS`, and that both rasters place the mark where `icon.svg`
+puts it. That last check exists because they once did not: the rasters were
+made from the brand kit's square PNG rather than from `icon.svg`, and the mark
+shipped about 5% larger on the iOS tile than in the browser tab.
+
 ## Environment
 
 | Variable | Notes |
