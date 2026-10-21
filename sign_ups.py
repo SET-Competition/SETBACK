@@ -153,8 +153,9 @@ def import_signups(path: str = SIGNUPS_CSV) -> None:
     rather than aborting the whole import.
 
     Read with the standard library rather than pandas. pandas was the only
-    thing pulling ~60MB of NumPy into a deploy that never runs this file -
-    the Railway service starts post_to_supabase.py - and its nan-for-blank
+    thing pulling ~60MB of NumPy into a deploy that never runs this function
+    - the Railway service starts post_to_supabase.py, which only drains the
+    form's inbox below - and its nan-for-blank
     behaviour is what put an encrypted literal "nan" into every Coinbase
     passphrase. DictReader yields plain strings, so a blank cell is just "".
 
@@ -193,8 +194,10 @@ def import_signups(path: str = SIGNUPS_CSV) -> None:
 #
 # Rows there are PLAINTEXT until drained - the browser does not encrypt, since
 # Fernet is symmetric and the page would need FERNET_KEY to do it. So the
-# time between a submission and this running is the whole exposure: drain
-# often. See section 8 of migrations/schema.sql.
+# time between a submission and this running is the whole exposure, which is
+# why every scheduled sync runs import_pending_signups() before it syncs - see
+# post_to_supabase.import_new_signups and section 8 of migrations/schema.sql.
+# Running this file by hand still works, for when an hour is too long.
 # ---------------------------------------------------------------------------
 
 # How many times a submission is retried before it is given up on.

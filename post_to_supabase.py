@@ -672,6 +672,38 @@ def sync_all_to_supabase() -> dict:
     }
 
 
+def import_new_signups():
+    """
+    Verify, encrypt and register everything waiting in pending_signups.
+    Returns sign_ups' counts, or None when the import could not run.
+
+    Part of every run because nothing else drains that table. The form's
+    Edge Function only inserts; until something imports a row, its
+    credentials sit in the database IN PLAINTEXT and the participant is not
+    tracked - and the equity history they miss in the meantime is gone for
+    good. Run by hand, both last for as long as nobody remembers. Here they
+    last at most one cron interval.
+
+    One page per run, not a loop to empty: a row whose verification fails
+    transiently stays pending, and looping would retry it at once rather
+    than an hour later. sign_ups gives up on a row after
+    MAX_IMPORT_ATTEMPTS, so a broken credential is wiped within that many
+    runs.
+
+    Never raises. A participant's bad key is that participant's problem and
+    is recorded on their row; even an import that cannot start at all must
+    not cost everyone else their snapshot. Imported here rather than at
+    module scope for the same reason score is: a broken sign_ups.py must not
+    stop data being collected.
+    """
+    try:
+        import sign_ups
+        return sign_ups.import_pending_signups()
+    except Exception as e:
+        logger.error("Importing pending signups failed - they stay pending for "
+                     "the next run: %s", e)
+        return None
+
 
 if __name__ == "__main__":
     # Configure logging HERE, not at import: a library that configures the
@@ -688,6 +720,11 @@ if __name__ == "__main__":
     # httpx logs every Supabase call at INFO - two lines per participant per
     # venue, which buries the sync's own output. Warnings still come through.
     logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    # BEFORE the sync, so someone who signed up since the last run is synced
+    # in this one - their first snapshot is taken now rather than an hour
+    # from now. Deliberately does not touch the exit code: see the docstring.
+    import_new_signups()
 
     summary = sync_all_to_supabase()
 

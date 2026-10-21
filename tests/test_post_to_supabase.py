@@ -107,3 +107,57 @@ def test_unusable_threshold_falls_back_rather_than_raising(clean_env, bad):
     """
     clean_env.setenv("SYNC_FAILURE_THRESHOLD", bad)
     assert post_to_supabase._failure_threshold() == 1.0
+
+
+# ---------------------------------------------------------------------------
+# import_new_signups
+#
+# The website's form only inserts into pending_signups. Until a row is
+# imported its credentials sit there in plaintext and the participant is not
+# tracked, so every run imports first. It must never cost the sync anything.
+# ---------------------------------------------------------------------------
+
+def _fake_sign_ups(monkeypatch, import_pending_signups):
+    import sys
+    import types
+    fake = types.ModuleType("sign_ups")
+    fake.import_pending_signups = import_pending_signups
+    monkeypatch.setitem(sys.modules, "sign_ups", fake)
+
+
+def test_new_signups_are_imported_and_counted(monkeypatch):
+    counts = {"pending": 2, "imported": 1, "rejected": 0, "deferred": 1}
+    _fake_sign_ups(monkeypatch, lambda: counts)
+    assert post_to_supabase.import_new_signups() == counts
+
+
+def test_a_failing_import_never_reaches_the_sync(monkeypatch, caplog):
+    def boom():
+        raise RuntimeError("Supabase is down")
+    _fake_sign_ups(monkeypatch, boom)
+
+    assert post_to_supabase.import_new_signups() is None
+    assert "stay pending for the next run" in caplog.text
+
+
+def test_a_broken_sign_ups_module_never_reaches_the_sync(monkeypatch):
+    """Imported inside the function, so even a module that cannot load is contained."""
+    import sys
+    monkeypatch.setitem(sys.modules, "sign_ups", None)     # makes `import` raise
+    assert post_to_supabase.import_new_signups() is None
+
+
+def test_signups_are_imported_before_the_sync_runs():
+    """
+    Order matters: imported first, a new participant's first snapshot is
+    taken in this run instead of the next one. Read from the entrypoint
+    itself, since it is a script block rather than a function.
+    """
+    import ast
+    from pathlib import Path
+
+    source = Path(post_to_supabase.__file__).read_text(encoding="utf-8")
+    main = next(node for node in ast.parse(source).body
+                if isinstance(node, ast.If) and "__main__" in ast.unparse(node.test))
+    calls = [ast.unparse(n.func) for n in ast.walk(main) if isinstance(n, ast.Call)]
+    assert calls.index("import_new_signups") < calls.index("sync_all_to_supabase")
