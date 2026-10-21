@@ -32,43 +32,72 @@ types are JSDoc, which TypeScript honours in a `.js` file.
 
 ## The brand marks
 
-The SET lockup and logomark are geometry, held once in
+The SET lockup and logomark are geometry and colour, held once in
 [`lib/marks.ts`](lib/marks.ts). Everything that draws them imports it:
 `app/brand.tsx` for the nav, `app/opengraph-image.tsx` for the share card.
 The words that go with them live in [`lib/copy.ts`](lib/copy.ts) for the same
 reason.
 
-Three files cannot import anything, because they are consumed as files:
+Three files cannot import anything, because they are consumed as files.
+[`scripts/build-icons.mjs`](scripts/build-icons.mjs) generates all three from
+`lib/marks.ts`:
 
-| File | What reads it |
-|---|---|
-| `app/icon.svg` | The browser tab, in anything modern. The source the other two are made from. |
-| `app/apple-icon.png` | iOS home screens. 180x180, **generated**. |
-| `app/favicon.ico` | Old browsers and some feed readers. 16+32, **generated**. |
+| File | What reads it | Ground |
+|---|---|---|
+| `app/icon.svg` | The browser tab | transparent, adapts |
+| `app/favicon.ico` | Browsers that will not take an SVG icon | transparent |
+| `app/apple-icon.png` | iOS home screens, 180x180 | opaque |
 
-`icon.svg`'s paths are a copy of `LOGOMARK_PATHS` and are not edited by
-hand - `lib/marks.ts` is regenerated from the brand kit and the paths are
-carried across, which `tests/test_brand_assets.py` enforces. What *is* chosen
-by hand is the rest of the file: the square canvas, the background rect, and
-the translate/scale that set the padding.
-
-Change the logo and you regenerate `lib/marks.ts` from the brand kit, carry
-`LOGOMARK_PATHS` into `app/icon.svg`, then run:
+Change the logo and you regenerate `lib/marks.ts` from the brand kit, then:
 
 ```bash
-npm run icons        # rasterises app/icon.svg into the other two
+npm run icons        # rewrites all three from lib/marks.ts
 ```
 
 Commit what it writes. It is deliberately not part of `npm run build`: Vercel
-would otherwise regenerate two committed binaries on every deploy, against
+would otherwise regenerate committed binaries on every deploy, against
 whatever libvips the builder ships, and a rendering change would reach
 production without ever appearing in a diff.
 
-`tests/test_brand_assets.py` holds these together — it checks that `icon.svg`
-draws `LOGOMARK_PATHS`, and that both rasters place the mark where `icon.svg`
-puts it. That last check exists because they once did not: the rasters were
-made from the brand kit's square PNG rather than from `icon.svg`, and the mark
-shipped about 5% larger on the iOS tile than in the browser tab.
+### Why the tab icon has no background
+
+It is drawn on the *browser's* chrome, not on the site, and this site has no
+light mode whose colours would apply. A single fill is wrong half the time —
+the brand's near-black vanishes into a dark tab strip, white vanishes into a
+light one. So `icon.svg` carries both and lets a `prefers-color-scheme` rule
+inside the SVG choose. Verified in Chrome: with the OS in dark mode it
+fetches `/icon.svg` — never `/favicon.ico`, despite the ICO being listed
+first — and renders the mark white.
+
+`favicon.ico` is that same SVG flattened, and a raster cannot carry a media
+query. It ships the light-chrome colour, because librsvg applies the default
+CSS rule and ignores the unmatched `prefers-color-scheme` block. **So a
+browser that both refuses SVG icons and runs dark chrome gets a near-black
+mark on a dark toolbar.** That is the one gap, it is narrow — a browser new
+enough to have dark chrome is almost always new enough to take the SVG — and
+closing it would mean putting a tile back behind the mark.
+
+`apple-icon.png` keeps its opaque brand tile on purpose: iOS composites a
+transparent home-screen icon onto a ground of its own choosing, so Apple's
+guidance is an opaque full-bleed icon. It is also padded where the favicon is
+nearly full-bleed, because iOS draws it as a rounded tile and the rounding
+needs margin — whereas a 16px tab icon has 256 pixels to work with and should
+not spend them on air.
+
+### What holds it together
+
+`tests/test_brand_assets.py` checks that `icon.svg` draws `LOGOMARK_PATHS`,
+that it is placed where the generator's constants say, that it carries both
+mark colours, that each raster sits on the ground its surface needs, and that
+the rasters place the mark where the generator's layout puts it.
+
+That last check exists because they once did not — both rasters were made
+from the brand kit's square PNG, whose padding is tighter, so the mark
+shipped about 5% larger on the iOS tile and 12% wider at 32px than in the
+browser tab. Its resolution is one pixel, which is the most a measurement off
+a thresholded anti-aliased edge can honestly claim. That is ample at 180px
+and 32px, and not enough at 16px, where a 12% error rounds to the same pixels
+as a correct one; the ICO's *directory* is checked exactly instead.
 
 ## Environment
 

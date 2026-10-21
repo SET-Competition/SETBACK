@@ -38,3 +38,21 @@ export const LOGOMARK_PATHS = [
  * tests/test_brand_assets.py asserts the two agree.
  */
 export const BRAND_BACKGROUND = "#08090b";
+
+/**
+ * The two colours the browser-tab icon is drawn in.
+ *
+ * The favicon is transparent, so it is drawn on the BROWSER's chrome, not on
+ * the site - and this site has no light mode to follow. A single colour is
+ * therefore wrong half the time: a near-black mark vanishes into a dark tab
+ * strip, a white one into a light one. app/icon.svg carries both and lets
+ * `prefers-color-scheme` inside the SVG pick, which is the only mechanism
+ * that adapts after the file is served.
+ *
+ * ON_LIGHT is the same value as BRAND_BACKGROUND, deliberately: the brand's
+ * near-black reads as ink on a light surface and as ground on a dark one.
+ * Written as its own constant anyway, because the day the page background
+ * changes is not the day the favicon's ink should.
+ */
+export const MARK_ON_LIGHT = "#08090b";
+export const MARK_ON_DARK = "#ffffff";
