@@ -11,8 +11,8 @@ deposit size.
 ## How it works
 
 ```
-/register (web/) ──► pending_signups ──► sign_ups.py: verify read-only,
-                                                      Fernet-encrypt
+/register (web/) ──► pending_signups ──► sign_ups (start of every sync):
+                                          verify read-only, Fernet-encrypt
         ┌────────────────────────────────────────────────┘
         ▼
 participant_api_keys  (Fernet-encrypted credentials in Supabase)
@@ -108,10 +108,10 @@ entries sort below established ones rather than disappearing.
 ## Commands
 
 ```bash
-uv run python post_to_supabase.py     # the scheduled job: sync, then score
+uv run python post_to_supabase.py     # the scheduled job: import signups, sync, score
 uv run python score.py                # rescore from stored history, no fetching
 uv run python score.py --period daily
-uv run python sign_ups.py             # drain pending signups from the form
+uv run python sign_ups.py             # import pending signups now, without syncing
 uv run python sign_ups.py --csv       # legacy: import participant_signups.csv
 uv run python metrics.py              # print Sharpe for everyone
 uv run python rotate_credentials.py --audit   # report credential SHAPES only
@@ -133,11 +133,15 @@ data.
 Participants submit at **`/register`** in the frontend ([`web/`](web/)), which
 POSTs to the `register` Edge Function. The importer then verifies each key
 against the exchange, encrypts it under `FERNET_KEY`, and wipes the plaintext.
+It runs at the start of every scheduled sync, so a new participant is
+registered and gets their first snapshot within one cron interval, with
+nobody having to remember to run it.
 
 ```
 /register  →  register (Edge Function)   rate-limit, validate, service role
       →  pending_signups                 anon can reach NOTHING here
-      →  sign_ups.py                     verify read-only against the exchange
+      →  sign_ups                        each sync, before syncing:
+                                         verify read-only against the exchange
                                          → Fernet-encrypt → participant_api_keys
                                          → wipe the plaintext row
 ```
@@ -186,7 +190,9 @@ is resolved automatically at verification, so participants never supply it.
    to submit and says so.
 4. Deploy over **HTTPS**. The page disables itself outside a secure context,
    because it asks people to type exchange credentials.
-5. Run `uv run python sign_ups.py` to drain the inbox.
+5. Nothing to run by hand: the next scheduled sync imports whatever is
+   waiting. `uv run python sign_ups.py` does it immediately, if you'd rather
+   not wait.
 
 On an existing database instead of step 1: run `migrations/003`, deploy the
 function, redeploy the site, then `migrations/004` — in that order. Between
@@ -197,10 +203,13 @@ The validation that runs before a credential leaves the browser lives in
 executes it under Node against this repository's schema — so the venue list,
 the POSTed columns and `pending_signups` cannot drift apart.
 
-**Drain it often.** Credentials sit in `pending_signups` **in plaintext**
-between submission and import — anyone who can read that table, and every
-Supabase backup taken while a row is pending, holds usable credentials. That
-window is the whole exposure and it is under your control.
+**It is drained every sync, and that is load-bearing.** Credentials sit in
+`pending_signups` **in plaintext** between submission and import — anyone who
+can read that table, and every Supabase backup taken while a row is pending,
+holds usable credentials. That window is the whole exposure. Each sync starts
+by importing, so it lasts at most one cron interval while the job is running
+— and as long as the job is down otherwise, which is one more reason to
+watch its exit code.
 
 The trade is deliberate and rests on two things. Every credential here is
 read-only, so a leak exposes positions rather than funds; and the rows clear

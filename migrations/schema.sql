@@ -18,7 +18,7 @@
 --   cash_flows            external deposits/withdrawals, so returns mean something
 --   fetch_errors          per-credential sync failures
 --   participant_scores    flow-adjusted Sharpe, what the ranking uses
---   pending_signups       the signup form inbox, drained by sign_ups.py
+--   pending_signups       the signup form inbox, drained by every sync
 --   latest_balances       view: current equity, by venue
 --   daily_balances        view: last snapshot per venue per day, for scoring
 --   leaderboard           view: the ranking
@@ -687,9 +687,11 @@ alter table public.participant_scores
 --      funds. If this table is ever used for a credential that can move
 --      money, this design is wrong.
 --
---   2. The window is short and under the operator's control. Rows are
---      cleared on import, so running sign_ups.py often keeps the table
---      empty. A table left undrained for weeks is the failure mode.
+--   2. The window is short. Rows are cleared on import, and every scheduled
+--      sync imports before it syncs (post_to_supabase.import_new_signups),
+--      so a row waits at most one cron interval. A table left undrained for
+--      weeks - the sync down, or the import step removed - is the failure
+--      mode.
 --
 -- The alternative - encrypting in the browser so this table never holds
 -- plaintext - cannot be done with Fernet. Fernet is symmetric, so the page

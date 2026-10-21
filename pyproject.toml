@@ -6,9 +6,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 # Runtime only. This is what Railway installs to run post_to_supabase.py.
 #
-# pandas used to be here for a single read_csv in sign_ups.py, which the
-# deploy never runs - ~60MB of NumPy in every build for one line. sign_ups
-# now uses the standard library's csv module instead.
+# pandas used to be here for a single read_csv in sign_ups.py's CSV import,
+# which the deploy never runs - ~60MB of NumPy in every build for one line.
+# sign_ups now uses the standard library's csv module instead. (The deploy
+# does import sign_ups, to drain the form's inbox, so it must stay light.)
 dependencies = [
     "ccxt>=4.5.58",
     "python-dotenv>=1.2.2",
